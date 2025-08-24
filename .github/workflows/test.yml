@@ -1,0 +1,151 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.8, 3.9, "3.10", "3.11"]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Set up test configuration
+      run: |
+        cp config/providers.example.json config/providers.json
+        cp config/routing.example.json config/routing.json
+    
+    - name: Validate configuration structure
+      run: |
+        python -c "
+        import json
+        import sys
+        
+        # Test providers config
+        try:
+            with open('config/providers.json') as f:
+                providers = json.load(f)
+            print('✅ providers.json is valid JSON')
+        except Exception as e:
+            print('❌ providers.json error:', e)
+            sys.exit(1)
+            
+        # Test routing config  
+        try:
+            with open('config/routing.json') as f:
+                routing = json.load(f)
+            print('✅ routing.json is valid JSON')
+        except Exception as e:
+            print('❌ routing.json error:', e)
+            sys.exit(1)
+        "
+    
+    - name: Test configuration loading
+      run: |
+        python -c "
+        import asyncio
+        from bkvy.core.config import ConfigManager
+        
+        async def test_config_loading():
+            config = ConfigManager()
+            await config.load_configs()
+            
+            assert len(config.providers) > 0, 'No providers loaded'
+            assert len(config.scenarios) > 0, 'No scenarios loaded'
+            
+            # Test intelligence mappings
+            low_models = config.get_models_by_intelligence('low')
+            medium_models = config.get_models_by_intelligence('medium')
+            high_models = config.get_models_by_intelligence('high')
+            
+            assert len(low_models) > 0, 'No low intelligence models'
+            assert len(medium_models) > 0, 'No medium intelligence models'
+            assert len(high_models) > 0, 'No high intelligence models'
+            
+            print('✅ Configuration loading test passed')
+        
+        asyncio.run(test_config_loading())
+        "
+    
+    - name: Test application startup
+      run: |
+        python -c "
+        import asyncio
+        from bkvy.core.config import ConfigManager
+        from bkvy.core.rate_limits import RateLimitManager
+        from bkvy.core.queues import QueueManager
+        from bkvy.core.llm_client import LLMClient
+        from bkvy.core.router import IntelligentRouter
+        
+        async def test_startup():
+            # Initialize all components
+            config = ConfigManager()
+            await config.load_configs()
+            
+            client = LLMClient()
+            await client.start()
+            
+            rate_limits = RateLimitManager()
+            queues = QueueManager()
+            router = IntelligentRouter(config, rate_limits, queues, client)
+            
+            print('✅ All components initialized successfully')
+            
+            # Test basic routing logic (without API calls)
+            low_models = config.get_models_by_intelligence('low')
+            assert len(low_models) > 0, 'No low intelligence models found'
+            
+            await client.stop()
+            print('✅ Application startup test passed')
+        
+        asyncio.run(test_startup())
+        "
+    
+    - name: Test API structure
+      run: |
+        python -c "
+        from bkvy.api.app import create_app
+        from bkvy.models.schemas import IntelligenceRequest, ScenarioRequest, DirectRequest
+        from bkvy.models.enums import IntelligenceLevel
+        
+        # Test app creation
+        app = create_app()
+        assert app is not None, 'Failed to create FastAPI app'
+        
+        # Test schema validation
+        request = IntelligenceRequest(
+            client_id='test',
+            intelligence_level=IntelligenceLevel.LOW,
+            max_wait_seconds=30,
+            messages=[{'role': 'user', 'content': 'test'}]
+        )
+        assert request.client_id == 'test'
+        assert request.intelligence_level == IntelligenceLevel.LOW
+        
+        print('✅ API structure test passed')
+        "
+    
+    - name: Lint check
+      run: |
+        python -m py_compile main.py
+        python -m py_compile bkvy/core/config.py
+        python -m py_compile bkvy/core/router.py
+        python -m py_compile bkvy/core/llm_client.py
+        python -m py_compile bkvy/api/app.py
+        echo "✅ Python syntax check passed"
