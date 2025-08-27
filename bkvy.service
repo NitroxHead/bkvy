@@ -1,0 +1,30 @@
+[Unit]
+Description=bkvy - LLM API Management Server
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bkvy
+Group=bkvy
+WorkingDirectory=/opt/bkvy
+Environment=PATH=/opt/bkvy/venv/bin
+Environment=HOST=0.0.0.0
+Environment=PORT=10006
+Environment=LOG_LEVEL=info
+Environment=WORKERS=1
+ExecStart=/opt/bkvy/venv/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security settings (relaxed for compatibility)
+NoNewPrivileges=yes
+
+# Process limits
+LimitNOFILE=1048576
+LimitNPROC=1048576
+
+[Install]
+WantedBy=multi-user.target

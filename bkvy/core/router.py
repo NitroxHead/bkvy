@@ -357,7 +357,7 @@ class IntelligentRouter:
     
     async def _execute_with_retry_and_fallback(self, sorted_analyses: List[CompletionTimeAnalysis],
                                              messages: List[Message], options: Optional[LLMOptions]) -> Tuple[Dict[str, Any], CompletionTimeAnalysis, Dict[str, Any]]:
-        """Execute request with retry logic and automatic failover - enhanced error handling"""
+        """Execute request with retry logic and automatic failover - enhanced error handling with 429 provider awareness"""
         MAX_RETRIES = 3
         attempt_info = {
             "alternatives_tried": 0,
@@ -365,7 +365,12 @@ class IntelligentRouter:
             "failures": []
         }
         
-        for analysis in sorted_analyses:
+        current_alternatives = sorted_analyses[:]
+        rate_limited_providers = set()  # Track providers that hit 429
+        
+        while current_alternatives:
+            # Get next alternative
+            analysis = current_alternatives.pop(0)
             attempt_info["alternatives_tried"] += 1
             
             logger.info("Trying alternative", 
@@ -396,9 +401,9 @@ class IntelligentRouter:
                                    model=analysis.model)
                         return result, analysis, attempt_info
                     else:
-                        # Check if this is a failure that should skip retries and move to next provider
+                        # Check error handling strategy
                         error_msg = result.get("error", "Unknown error")
-                        should_skip_retries = self._should_skip_retries(error_msg)
+                        error_strategy = self._should_skip_retries(error_msg)
                         
                         logger.warning("Attempt failed", 
                                      alternative=attempt_info["alternatives_tried"],
@@ -406,7 +411,7 @@ class IntelligentRouter:
                                      provider=analysis.provider,
                                      model=analysis.model,
                                      error=error_msg,
-                                     skip_retries=should_skip_retries)
+                                     strategy=error_strategy)
                         
                         attempt_info["failures"].append({
                             "alternative": attempt_info["alternatives_tried"],
@@ -415,35 +420,53 @@ class IntelligentRouter:
                             "model": analysis.model,
                             "api_key_id": analysis.api_key_id,
                             "error": error_msg,
-                            "skip_retries": should_skip_retries
+                            "strategy": error_strategy
                         })
                         
-                        # If should skip retries or this was the last retry, break to try next alternative
-                        if should_skip_retries or retry_attempt == MAX_RETRIES:
-                            if should_skip_retries:
-                                logger.info("Skipping retries due to error type, moving to next provider", 
+                        # Handle different error strategies
+                        if error_strategy == "skip_alternative":
+                            # For rate limiting (429), reorder remaining alternatives to prioritize same provider
+                            if "429" in error_msg or "rate limited" in error_msg.lower():
+                                rate_limited_providers.add(analysis.provider)
+                                current_alternatives = self._reorder_alternatives_for_rate_limit(
+                                    current_alternatives, analysis.provider
+                                )
+                                logger.info("Rate limit detected, reordered alternatives for provider recovery", 
                                            provider=analysis.provider,
-                                           model=analysis.model,
-                                           error=error_msg)
-                            else:
+                                           remaining_alternatives=len(current_alternatives))
+                            break  # Skip to next alternative
+                        elif error_strategy == "skip_provider":
+                            # Remove all remaining alternatives from this provider
+                            provider_to_skip = analysis.provider
+                            original_count = len(current_alternatives)
+                            current_alternatives = [alt for alt in current_alternatives if alt.provider != provider_to_skip]
+                            removed_count = original_count - len(current_alternatives)
+                            logger.info("Provider authentication failed, removing all alternatives", 
+                                       provider=provider_to_skip,
+                                       removed_alternatives=removed_count,
+                                       remaining_alternatives=len(current_alternatives))
+                            break  # Skip to next alternative
+                        elif error_strategy == "retry":
+                            # Continue with retry logic
+                            if retry_attempt == MAX_RETRIES:
                                 logger.error("Alternative exhausted after retries", 
                                            provider=analysis.provider,
                                            model=analysis.model,
                                            api_key_id=analysis.api_key_id,
                                            retries=MAX_RETRIES)
-                            break
-                        else:
-                            # Wait a bit before retry (exponential backoff)
-                            wait_time = min(2 ** (retry_attempt - 1), 5)  # 1s, 2s, 4s max
-                            logger.info("Retrying after wait", 
-                                       wait_seconds=wait_time,
-                                       next_retry=retry_attempt + 1)
-                            await asyncio.sleep(wait_time)
+                                break
+                            else:
+                                # Wait a bit before retry (exponential backoff)
+                                wait_time = min(2 ** (retry_attempt - 1), 5)  # 1s, 2s, 4s max
+                                logger.info("Retrying after wait", 
+                                           wait_seconds=wait_time,
+                                           next_retry=retry_attempt + 1)
+                                await asyncio.sleep(wait_time)
                             
                 except Exception as e:
                     # Unexpected error (not from API response)
                     error_msg = f"Unexpected error: {str(e)}"
-                    should_skip_retries = self._should_skip_retries(str(e))
+                    error_strategy = self._should_skip_retries(str(e))
                     
                     logger.error("Unexpected error during attempt", 
                                alternative=attempt_info["alternatives_tried"],
@@ -451,7 +474,7 @@ class IntelligentRouter:
                                provider=analysis.provider,
                                model=analysis.model,
                                error=error_msg,
-                               skip_retries=should_skip_retries,
+                               strategy=error_strategy,
                                traceback=traceback.format_exc())
                     
                     attempt_info["failures"].append({
@@ -461,11 +484,11 @@ class IntelligentRouter:
                         "model": analysis.model,
                         "api_key_id": analysis.api_key_id,
                         "error": error_msg,
-                        "skip_retries": should_skip_retries
+                        "strategy": error_strategy
                     })
                     
-                    # For rate limiting or critical errors, skip retries
-                    if should_skip_retries or retry_attempt == MAX_RETRIES:
+                    # Apply same strategy logic as above
+                    if error_strategy != "retry" or retry_attempt == MAX_RETRIES:
                         break
                     else:
                         wait_time = min(2 ** (retry_attempt - 1), 5)
@@ -476,6 +499,7 @@ class IntelligentRouter:
         logger.error("All alternatives exhausted", 
                    alternatives_tried=attempt_info["alternatives_tried"],
                    total_attempts=attempt_info["total_attempts"],
+                   rate_limited_providers=list(rate_limited_providers),
                    last_error=last_error)
         
         return {
@@ -483,36 +507,74 @@ class IntelligentRouter:
             "error": f"All {attempt_info['alternatives_tried']} alternatives failed after {attempt_info['total_attempts']} total attempts"
         }, sorted_analyses[0] if sorted_analyses else None, attempt_info
     
-    def _should_skip_retries(self, error_msg: str) -> bool:
-        """Determine if an error should skip retries and move to next provider"""
+    def _should_skip_retries(self, error_msg: str) -> str:
+        """Determine error handling strategy: 'retry', 'skip_alternative', or 'skip_provider'"""
         error_lower = error_msg.lower()
         
-        # Rate limiting errors - skip retries
+        # Rate limiting errors - skip to next alternative within same provider first
         if any(phrase in error_lower for phrase in [
             "rate limited", "429", "quota", "exceeded", "resource_exhausted"
         ]):
-            return True
+            return "skip_alternative"
             
-        # Authentication errors - skip retries  
+        # Authentication errors - skip entire provider (all keys likely invalid)
         if any(phrase in error_lower for phrase in [
             "401", "403", "unauthorized", "forbidden", "invalid api key"
         ]):
-            return True
+            return "skip_provider"
             
-        # Content/response errors that won't be fixed by retrying
+        # Content/response errors that won't be fixed by retrying - skip this alternative
         if any(phrase in error_lower for phrase in [
             "empty content", "could not extract content", "max_tokens"
         ]):
-            return True
+            return "skip_alternative"
             
         # Network errors that might be temporary - allow retries
         if any(phrase in error_lower for phrase in [
             "timeout", "connection", "network", "500", "502", "503", "504"
         ]):
-            return False
+            return "retry"
             
         # Default: allow retries for unknown errors
-        return False
+        return "retry"
+    
+    def _reorder_alternatives_for_rate_limit(self, sorted_analyses: List[CompletionTimeAnalysis], 
+                                           failed_provider: str) -> List[CompletionTimeAnalysis]:
+        """Reorder alternatives to prioritize same provider alternatives after 429 error"""
+        # Separate alternatives by provider
+        same_provider = []
+        other_providers = []
+        
+        for analysis in sorted_analyses:
+            if analysis.provider == failed_provider:
+                same_provider.append(analysis)
+            else:
+                other_providers.append(analysis)
+        
+        # For same provider alternatives, sort by: different models first, then different API keys
+        # This handles the case where rate limits might be per-model or per-key
+        same_provider_reordered = []
+        processed_models = set()
+        
+        # First pass: different models with same provider (rate limits often per-model)
+        for analysis in same_provider:
+            if analysis.model not in processed_models:
+                same_provider_reordered.append(analysis)
+                processed_models.add(analysis.model)
+        
+        # Second pass: same models but different API keys (rate limits often per-key)
+        for analysis in same_provider:
+            if analysis not in same_provider_reordered:
+                same_provider_reordered.append(analysis)
+        
+        # Return: same provider alternatives first, then other providers
+        logger.info("🔄 Reordered alternatives for rate limit recovery", 
+                   failed_provider=failed_provider,
+                   same_provider_count=len(same_provider_reordered),
+                   other_provider_count=len(other_providers),
+                   reordered_sequence=[f"{a.provider}/{a.model}/{a.api_key_id}" for a in same_provider_reordered + other_providers][:5])
+        
+        return same_provider_reordered + other_providers
     
     async def _execute_request(self, analysis: CompletionTimeAnalysis, 
                              messages: List[Message], options: Optional[LLMOptions]) -> Dict[str, Any]:
