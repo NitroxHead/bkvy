@@ -785,6 +785,14 @@ class IntelligentRouter:
             key_config = provider_config.keys[api_key_id]
             model_config = provider_config.models[model]
             
+            # Special handling for Ollama: check health before proceeding
+            if provider == "ollama":
+                is_healthy = await self.llm_client.check_ollama_health(model_config.endpoint)
+                if not is_healthy:
+                    logger.warning("Ollama health check failed, skipping", 
+                                 provider=provider, model=model, endpoint=model_config.endpoint)
+                    return None
+            
             # Get rate limits for this combination
             rate_limits = key_config.rate_limits[model]
             rpm_limit = rate_limits["rpm"]

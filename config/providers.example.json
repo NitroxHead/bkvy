@@ -121,5 +121,48 @@
         "supports_thinking": true
       }
     }
+  },
+  "ollama": {
+    "keys": {
+      "ollama_default": {
+        "api_key": "none_required",
+        "rate_limits": {
+          "gpt-oss:20b": {"rpm": 60, "rpd": 2000},
+          "llama3.2:3b": {"rpm": 60, "rpd": 2000},
+          "codellama:7b": {"rpm": 40, "rpd": 1500},
+          "mistral:7b": {"rpm": 40, "rpd": 1500}
+        }
+      }
+    },
+    "models": {
+      "gpt-oss:20b": {
+        "endpoint": "http://10.151.197.16:11434/api/chat",
+        "cost_per_1k_tokens": 0.0,
+        "avg_response_time_ms": 5000,
+        "intelligence_tier": "high",
+        "supports_thinking": true
+      },
+      "llama3.2:3b": {
+        "endpoint": "http://10.151.197.16:11434/api/chat",
+        "cost_per_1k_tokens": 0.0,
+        "avg_response_time_ms": 2000,
+        "intelligence_tier": "low",
+        "supports_thinking": false
+      },
+      "codellama:7b": {
+        "endpoint": "http://10.151.197.16:11434/api/chat",
+        "cost_per_1k_tokens": 0.0,
+        "avg_response_time_ms": 3500,
+        "intelligence_tier": "medium",
+        "supports_thinking": false
+      },
+      "mistral:7b": {
+        "endpoint": "http://10.151.197.16:11434/api/chat",
+        "cost_per_1k_tokens": 0.0,
+        "avg_response_time_ms": 3000,
+        "intelligence_tier": "medium",
+        "supports_thinking": false
+      }
+    }
   }
 }

@@ -30,6 +30,31 @@ class LLMClient:
         if self.session:
             await self.session.close()
     
+    async def check_ollama_health(self, endpoint: str) -> bool:
+        """Check if Ollama server is available and responsive"""
+        try:
+            # Extract base URL from chat endpoint
+            if "/api/chat" in endpoint:
+                base_url = endpoint.replace("/api/chat", "")
+            else:
+                base_url = endpoint
+            
+            health_endpoint = f"{base_url}/api/version"
+            
+            logger.info("Checking Ollama health", endpoint=health_endpoint)
+            
+            async with self.session.get(health_endpoint, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    logger.info("Ollama health check passed", version=result.get("version", "unknown"))
+                    return True
+                else:
+                    logger.warning("Ollama health check failed", status=response.status)
+                    return False
+        except Exception as e:
+            logger.warning("Ollama health check failed with exception", error=str(e))
+            return False
+
     async def _make_api_call(self, provider: str, model: str, api_key: str, 
                            messages: List[Dict], options: Dict, 
                            endpoint: str, version: Optional[str] = None) -> Dict[str, Any]:
@@ -41,6 +66,8 @@ class LLMClient:
             return await self._call_openai(endpoint, api_key, model, messages, options)
         elif provider == "anthropic":
             return await self._call_anthropic(endpoint, api_key, model, messages, options, version)
+        elif provider == "ollama":
+            return await self._call_ollama(endpoint, api_key, model, messages, options)
         else:
             raise ValueError(f"Unsupported provider: {provider}")
     
@@ -321,5 +348,103 @@ class LLMClient:
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
                 },
+                "raw_response": result
+            }
+    
+    async def _call_ollama(self, endpoint: str, api_key: str, model: str,
+                          messages: List[Dict], options: Dict) -> Dict[str, Any]:
+        """Call Ollama API"""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False
+        }
+        
+        # Add options with validation
+        if "max_tokens" in options and options["max_tokens"] is not None:
+            payload["options"] = payload.get("options", {})
+            payload["options"]["num_predict"] = options["max_tokens"]
+        
+        if "temperature" in options and options["temperature"] is not None:
+            payload["options"] = payload.get("options", {})
+            payload["options"]["temperature"] = max(0.0, min(2.0, options["temperature"]))
+        
+        if "top_p" in options and options["top_p"] is not None:
+            payload["options"] = payload.get("options", {})
+            payload["options"]["top_p"] = max(0.0, min(1.0, options["top_p"]))
+        
+        if "top_k" in options and options["top_k"] is not None:
+            payload["options"] = payload.get("options", {})
+            payload["options"]["top_k"] = max(1, options["top_k"])
+        
+        if "stop" in options and options["stop"] is not None:
+            payload["options"] = payload.get("options", {})
+            payload["options"]["stop"] = options["stop"]
+        
+        # Ollama doesn't require API keys, but we'll include headers for consistency
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        logger.info("Making Ollama API call", endpoint=endpoint, model=model, 
+                   payload_size=len(str(payload)))
+        
+        async with self.session.post(endpoint, json=payload, headers=headers) as response:
+            if response.status == 429:
+                error_text = await response.text()
+                raise Exception(f"Ollama API rate limited {response.status}: {error_text}")
+            elif response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"Ollama API error {response.status}: {error_text}")
+            
+            result = await response.json()
+            logger.info("Ollama API response received", has_message=bool(result.get("message")))
+            
+            # Extract content from Ollama response format
+            content = ""
+            finish_reason = "stop"
+            
+            if "message" in result and isinstance(result["message"], dict):
+                message = result["message"]
+                if "content" in message:
+                    content = message["content"]
+                
+                # Handle thinking content if present
+                if "thinking" in message and message["thinking"]:
+                    thinking_content = message["thinking"]
+                    logger.info("Ollama returned thinking content", thinking_length=len(thinking_content))
+                    # For consistency, we don't include thinking in the main content
+                    # but log its presence for debugging
+            
+            if "done_reason" in result:
+                finish_reason = result["done_reason"]
+            
+            # Handle empty response
+            if not content or content.strip() == "":
+                error_msg = f"Ollama returned empty content (done_reason: {finish_reason})"
+                logger.error(error_msg, result_keys=list(result.keys()))
+                raise Exception(error_msg)
+            
+            # Extract usage/token information from Ollama response
+            input_tokens = result.get("prompt_eval_count", 0)
+            output_tokens = result.get("eval_count", 0)
+            total_tokens = input_tokens + output_tokens
+            
+            # Fallback token estimation if not provided
+            if input_tokens == 0:
+                input_tokens = sum(len(msg["content"].split()) for msg in messages)
+            if output_tokens == 0 and content:
+                output_tokens = len(content.split())
+            if total_tokens == 0:
+                total_tokens = input_tokens + output_tokens
+            
+            return {
+                "content": content,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens
+                },
+                "finish_reason": finish_reason,
                 "raw_response": result
             }
