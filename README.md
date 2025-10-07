@@ -27,6 +27,7 @@ I've grown tired of reimplementing robust LLM API management for every applicati
 - **Queue Optimization**: Intelligent request scheduling and load balancing
 - **Scenario-Based Routing**: Pre-configured routing strategies for different use cases
 - **Thinking Control**: Automatic token optimization for reasoning models
+- **Optional Statistics Logging**: Track usage patterns without storing message content
 
 ### Project Structure
 
@@ -46,12 +47,17 @@ bkvy/
 │   ├── app.py              # FastAPI endpoints
 │   └── lifespan.py         # Application lifecycle management
 └── utils/                  # Utility functions
-    └── logging.py          # Structured logging setup
+    ├── logging.py          # Structured logging setup
+    ├── transaction_logger.py  # Detailed CSV transaction logs
+    └── summary_stats.py    # Lightweight daily statistics
 
 main.py                     # Application entry point
 config/                     # Configuration files
 ├── providers.json          # API keys and model configs
 └── routing.json            # Scenario definitions
+logs/                       # Optional logging outputs
+├── transactions.csv        # Detailed request logs (if enabled)
+└── daily_stats.json        # Daily aggregated statistics (if enabled)
 ```
 
 ## 🚀 Quick Start
@@ -256,6 +262,97 @@ curl http://localhost:10006/queue/status
 curl http://localhost:10006/rates/status
 ```
 
+### Statistics (if enabled)
+
+```bash
+# Check logging status
+curl http://localhost:10006/statistics/status
+
+# Get aggregate statistics
+curl http://localhost:10006/statistics/aggregate
+
+# Get daily statistics
+curl http://localhost:10006/statistics/daily/2025-01-15
+```
+
+## 📊 Statistics & Logging
+
+bkvy includes **two optional, independent logging systems** that track usage patterns while respecting privacy (no message content is logged).
+
+### Transaction Logging (Detailed CSV)
+
+Tracks full request details for debugging and auditing.
+
+**Enable:**
+```bash
+# In bkvy.service or environment
+export TRANSACTION_LOGGING=true
+```
+
+**Output:** `logs/transactions.csv`
+
+**Includes:**
+- Request metadata (client_id, routing_method, intelligence_level)
+- Performance metrics (response time, tokens, cost estimates)
+- Routing decisions (provider, model, API key used)
+- Fallback attempts and alternatives tried
+- Error types and messages
+
+**Use cases:** Detailed analysis, debugging, compliance auditing
+
+### Summary Statistics (Lightweight JSON)
+
+Maintains daily aggregated statistics independent of detailed logs.
+
+**Enable:**
+```bash
+# In bkvy.service or environment
+export SUMMARY_STATS=true
+```
+
+**Output:** `logs/daily_stats.json`
+
+**Includes (by day):**
+- Total requests and success rates
+- Breakdown by routing method, intelligence level, provider
+- Error counts by type
+- Total cost estimates
+- Average response times
+
+**Use cases:** Monitoring dashboards, trend analysis, capacity planning
+
+**Example daily_stats.json:**
+```json
+{
+  "2025-01-15": {
+    "total_requests": 1247,
+    "successful": 1198,
+    "by_routing_method": {"intelligence": 856, "scenario": 298, "direct": 93},
+    "by_intelligence": {"low": 623, "medium": 412, "high": 212},
+    "by_provider": {"openai": 534, "anthropic": 421, "gemini": 243},
+    "errors": {"rate_limited": 35, "model_not_found": 8},
+    "total_cost": 23.46,
+    "avg_response_time_ms": 1250
+  }
+}
+```
+
+### Privacy & Security
+
+- ✅ **No message content** stored in either logging system
+- ✅ **Disabled by default** - opt-in only
+- ✅ **API keys logged as identifiers** only (e.g., "openai_key_1"), not actual values
+- ✅ **Local storage** - all data stays on your server
+- ✅ **Independent systems** - use one, both, or neither
+
+### Statistics API Endpoints
+
+- `GET /statistics/status` - Check which logging systems are enabled
+- `GET /statistics/summary` - Transaction log summary (if enabled)
+- `GET /statistics/aggregate` - Aggregated stats across all days
+- `GET /statistics/daily/{date}` - Stats for specific date (YYYY-MM-DD)
+- `GET /statistics/daily` - All daily statistics (pivot table)
+
 ## 🛠️ Advanced Features
 
 ### Thinking Control
@@ -348,7 +445,6 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - 📖 [Documentation](docs/)
 - 🐛 [Issues](https://github.com/NitroxHead/bkvy/issues)
-- 💬 [Discussions](https://github.com/NitroxHead/bkvy/discussions)
 
 ## 🔮 Roadmap
 

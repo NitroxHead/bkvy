@@ -13,6 +13,10 @@ Environment=HOST=0.0.0.0
 Environment=PORT=10006
 Environment=LOG_LEVEL=info
 Environment=WORKERS=1
+# Uncomment to enable detailed transaction logging (CSV with full request details)
+#Environment=TRANSACTION_LOGGING=true
+# Uncomment to enable summary statistics (JSON with daily aggregates, lightweight)
+#Environment=SUMMARY_STATS=true
 ExecStart=/opt/bkvy/venv/bin/python main.py
 Restart=always
 RestartSec=5

@@ -431,6 +431,79 @@ Set realistic response times for accurate routing:
 }
 ```
 
+## Environment Variables
+
+The server supports several environment variables for configuration:
+
+### Server Configuration
+
+- `HOST` (default: `0.0.0.0`): Server bind address
+- `PORT` (default: `10006`): Server port
+- `LOG_LEVEL` (default: `info`): Logging level (debug, info, warning, error)
+- `WORKERS` (default: `1`): Number of worker processes
+- `LOG_DIR` (default: `logs`): Directory for log files
+
+### Statistics & Logging
+
+Both logging systems are **disabled by default** (opt-in for privacy).
+
+#### Transaction Logging (Detailed CSV)
+
+Tracks full request details for debugging and compliance.
+
+- `TRANSACTION_LOGGING` (default: `false`): Enable detailed transaction logging
+  - Set to `true` to enable
+  - Logs to `logs/transactions.csv`
+  - Contains: client_id, provider, model, tokens, costs, errors, routing decisions
+
+**Enable in systemd service:**
+```bash
+# Edit /etc/systemd/system/bkvy.service
+Environment=TRANSACTION_LOGGING=true
+```
+
+**Enable in shell:**
+```bash
+export TRANSACTION_LOGGING=true
+python main.py
+```
+
+#### Summary Statistics (Lightweight JSON)
+
+Maintains daily aggregated statistics independent of detailed logs.
+
+- `SUMMARY_STATS` (default: `false`): Enable summary statistics logging
+  - Set to `true` to enable
+  - Logs to `logs/daily_stats.json`
+  - Contains: daily aggregates, success rates, provider usage, cost totals
+  - Survives CSV deletion/rotation
+
+**Enable in systemd service:**
+```bash
+# Edit /etc/systemd/system/bkvy.service
+Environment=SUMMARY_STATS=true
+```
+
+**Enable in shell:**
+```bash
+export SUMMARY_STATS=true
+python main.py
+```
+
+**Use both systems:**
+```bash
+# Both can run independently
+Environment=TRANSACTION_LOGGING=true
+Environment=SUMMARY_STATS=true
+```
+
+### Privacy & Security
+
+- ✅ **No message content** stored in either logging system
+- ✅ **Disabled by default** - explicit opt-in required
+- ✅ **API keys logged as identifiers** only (e.g., "openai_key_1")
+- ✅ **Local storage** - all data stays on your server
+
 ## Environment-Based Configuration
 
 ### Development Configuration

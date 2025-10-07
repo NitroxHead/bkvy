@@ -24,25 +24,37 @@ from .models.schemas import (
 )
 
 from .api.app import create_app
+from .utils.transaction_logger import TransactionLogger, init_transaction_logger, get_transaction_logger
+from .utils.summary_stats import SummaryStatsLogger, init_summary_stats_logger, get_summary_stats_logger
 
 __all__ = [
     # Core managers
     'ConfigManager',
-    'RateLimitManager', 
+    'RateLimitManager',
     'QueueManager',
     'LLMClient',
     'IntelligentRouter',
-    
+
     # Models and schemas
     'IntelligenceLevel',
     'RoutingMethod',
     'IntelligenceRequest',
-    'ScenarioRequest', 
+    'ScenarioRequest',
     'DirectRequest',
     'LLMResponse',
     'Message',
     'LLMOptions',
-    
+
+    # Transaction logging (detailed CSV)
+    'TransactionLogger',
+    'init_transaction_logger',
+    'get_transaction_logger',
+
+    # Summary statistics (daily aggregates JSON)
+    'SummaryStatsLogger',
+    'init_summary_stats_logger',
+    'get_summary_stats_logger',
+
     # App factory
     'create_app'
 ]

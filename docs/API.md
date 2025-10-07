@@ -297,6 +297,183 @@ Get current rate limit states.
 }
 ```
 
+## Statistics Endpoints
+
+Optional logging systems that track usage patterns while respecting privacy (no message content is stored).
+
+### Statistics Status
+
+Check which logging systems are enabled.
+
+**Endpoint:** `GET /statistics/status`
+
+**Response:**
+```json
+{
+  "transaction_logging": {
+    "enabled": true,
+    "log_file": "/path/to/logs/transactions.csv",
+    "log_directory": "/path/to/logs"
+  },
+  "summary_stats": {
+    "enabled": true,
+    "stats_file": "/path/to/logs/daily_stats.json",
+    "log_directory": "/path/to/logs"
+  }
+}
+```
+
+### Transaction Log Summary
+
+Get aggregate statistics from detailed transaction logs (CSV).
+
+**Endpoint:** `GET /statistics/summary`
+
+**Requires:** `TRANSACTION_LOGGING=true`
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "total_requests": 1247,
+  "successful_requests": 1198,
+  "success_rate": 0.961,
+  "routing_methods": {
+    "intelligence": 856,
+    "scenario": 298,
+    "direct": 93
+  },
+  "providers_used": {
+    "openai": 534,
+    "anthropic": 421,
+    "gemini": 243
+  },
+  "intelligence_levels": {
+    "low": 623,
+    "medium": 412,
+    "high": 212
+  },
+  "errors": {
+    "rate_limited": 35,
+    "model_not_found": 8
+  },
+  "total_cost_estimate": 23.456789,
+  "log_file": "/path/to/logs/transactions.csv"
+}
+```
+
+### Aggregate Statistics
+
+Get aggregated statistics across all days from summary stats.
+
+**Endpoint:** `GET /statistics/aggregate`
+
+**Requires:** `SUMMARY_STATS=true`
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "total_requests": 1247,
+  "successful_requests": 1198,
+  "success_rate": 0.961,
+  "routing_methods": {
+    "intelligence": 856,
+    "scenario": 298,
+    "direct": 93
+  },
+  "providers_used": {
+    "openai": 534,
+    "anthropic": 421,
+    "gemini": 243
+  },
+  "intelligence_levels": {
+    "low": 623,
+    "medium": 412,
+    "high": 212
+  },
+  "errors": {
+    "rate_limited": 35,
+    "model_not_found": 8
+  },
+  "total_cost_estimate": 23.46,
+  "days_tracked": 7,
+  "stats_file": "/path/to/logs/daily_stats.json"
+}
+```
+
+### Daily Statistics
+
+Get statistics for a specific date.
+
+**Endpoint:** `GET /statistics/daily/{date}`
+
+**Requires:** `SUMMARY_STATS=true`
+
+**Parameters:**
+- `date`: Date in YYYY-MM-DD format (e.g., `2025-01-15`)
+
+**Response:**
+```json
+{
+  "date": "2025-01-15",
+  "total_requests": 178,
+  "successful": 171,
+  "success_rate": 0.961,
+  "by_routing_method": {
+    "intelligence": 122,
+    "scenario": 43,
+    "direct": 13
+  },
+  "by_intelligence": {
+    "low": 89,
+    "medium": 59,
+    "high": 30
+  },
+  "by_provider": {
+    "openai": 76,
+    "anthropic": 60,
+    "gemini": 35
+  },
+  "errors": {
+    "rate_limited": 5,
+    "model_not_found": 2
+  },
+  "total_cost": 3.35,
+  "avg_response_time_ms": 1250
+}
+```
+
+### All Daily Statistics
+
+Get statistics for all dates (daily pivot table).
+
+**Endpoint:** `GET /statistics/daily`
+
+**Requires:** `SUMMARY_STATS=true`
+
+**Response:**
+```json
+{
+  "2025-01-15": {
+    "total_requests": 178,
+    "successful": 171,
+    "success_rate": 0.961,
+    "by_routing_method": {"intelligence": 122, "scenario": 43, "direct": 13},
+    "by_intelligence": {"low": 89, "medium": 59, "high": 30},
+    "by_provider": {"openai": 76, "anthropic": 60, "gemini": 35},
+    "errors": {"rate_limited": 5},
+    "total_cost": 3.35,
+    "avg_response_time_ms": 1250
+  },
+  "2025-01-16": {
+    "total_requests": 203,
+    "successful": 198,
+    "..."
+  }
+}
+```
+
 ## Error Responses
 
 All endpoints may return error responses with the following structure:

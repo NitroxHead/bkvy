@@ -16,6 +16,8 @@ from ..models.schemas import (
     LLMResponse, SimplifiedResponse, ResponseMetadata, Message, LLMOptions
 )
 from ..utils.logging import setup_logging
+from ..utils.transaction_logger import get_transaction_logger, TransactionRecord
+from ..utils.summary_stats import get_summary_stats_logger
 
 logger = setup_logging()
 
@@ -28,6 +30,65 @@ class IntelligentRouter:
         self.rate_limits = rate_limit_manager
         self.queues = queue_manager
         self.llm_client = llm_client
+
+    async def _log_transaction(self, record: TransactionRecord):
+        """Log transaction to both detailed and summary loggers if available"""
+        # Log to detailed transaction logger (CSV)
+        transaction_logger = get_transaction_logger()
+        if transaction_logger:
+            await transaction_logger.log_transaction(record)
+
+        # Log to summary stats logger (JSON daily aggregates)
+        summary_logger = get_summary_stats_logger()
+        if summary_logger:
+            await summary_logger.log_request(
+                success=record.success,
+                routing_method=record.routing_method,
+                intelligence_level=record.intelligence_level,
+                provider_used=record.provider_used,
+                error_type=record.error_type,
+                cost_estimate=record.cost_estimate,
+                total_time_ms=record.total_time_ms
+            )
+
+    async def _log_successful_transaction(self, transaction_record: TransactionRecord, full_response: LLMResponse,
+                                        used_analysis, result: Dict[str, Any], attempt_info: Dict[str, Any], total_time: float):
+        """Helper to log successful transaction"""
+        if transaction_record:
+            transaction_record.success = True
+            transaction_record.provider_used = used_analysis.provider
+            transaction_record.model_used = used_analysis.model
+            transaction_record.api_key_used = used_analysis.api_key_id
+            transaction_record.total_time_ms = int(total_time * 1000)
+            transaction_record.decision_reason = full_response.decision_reason
+            transaction_record.fallback_attempts = attempt_info.get('total_attempts', 1) - 1
+            transaction_record.alternatives_tried = attempt_info.get('alternatives_tried', 1)
+
+            # Extract usage and cost if available
+            response_data = result.get("response", {})
+            usage = response_data.get("usage")
+            if usage:
+                transaction_record.input_tokens = usage.get("input_tokens")
+                transaction_record.output_tokens = usage.get("output_tokens")
+                if transaction_record.input_tokens and transaction_record.output_tokens:
+                    total_tokens = transaction_record.input_tokens + transaction_record.output_tokens
+                    transaction_record.cost_estimate = (total_tokens / 1000) * used_analysis.cost_per_1k_tokens
+
+            transaction_record.finish_reason = response_data.get("finish_reason")
+            await self._log_transaction(transaction_record)
+
+    async def _log_failed_transaction(self, transaction_record: TransactionRecord, error_type: str,
+                                    error_message: str, total_time: float, attempt_info: Dict[str, Any] = None):
+        """Helper to log failed transaction"""
+        if transaction_record:
+            transaction_record.success = False
+            transaction_record.error_type = error_type
+            transaction_record.error_message = error_message
+            transaction_record.total_time_ms = int(total_time * 1000)
+            if attempt_info:
+                transaction_record.fallback_attempts = attempt_info.get('total_attempts', 1) - 1
+                transaction_record.alternatives_tried = attempt_info.get('alternatives_tried', 1)
+            await self._log_transaction(transaction_record)
     
     def _create_simplified_response(self, full_response: LLMResponse) -> SimplifiedResponse:
         """Convert a full response to a simplified response"""
@@ -57,13 +118,25 @@ class IntelligentRouter:
     
     async def route_intelligence_request(self, request: IntelligenceRequest) -> LLMResponse:
         """Route request based on intelligence level - WAITS FOR COMPLETION WITH RETRY LOGIC"""
-        logger.info("Processing intelligence-based request", 
+        logger.info("Processing intelligence-based request",
                    client_id=request.client_id,
                    intelligence_level=request.intelligence_level,
                    max_wait=request.max_wait_seconds)
-        
+
         start_time = time.time()
         request_id = str(uuid.uuid4())
+
+        # Create transaction record
+        transaction_logger = get_transaction_logger()
+        transaction_record = None
+        if transaction_logger:
+            transaction_record = transaction_logger.create_record(
+                request_id=request_id,
+                client_id=request.client_id,
+                routing_method="intelligence"
+            )
+            transaction_record.intelligence_level = request.intelligence_level.value
+            transaction_record.max_wait_seconds = request.max_wait_seconds
         
         # Get all models matching intelligence level
         model_combinations = self.config.get_models_by_intelligence(request.intelligence_level.value)
@@ -80,6 +153,10 @@ class IntelligentRouter:
                 error_code="no_models_available",
                 message=f"No models available for intelligence level: {request.intelligence_level.value}"
             )
+
+            # Log transaction failure
+            await self._log_failed_transaction(transaction_record, "no_models_available", full_response.message, time.time() - start_time)
+
             if not request.debug:
                 return self._create_simplified_response(full_response)
             return full_response
@@ -145,7 +222,10 @@ class IntelligentRouter:
                 response=result["response"],
                 metadata=self._create_metadata_with_attempts(used_analysis, sorted_analyses, total_time, attempt_info)
             )
-            
+
+            # Log successful transaction
+            await self._log_successful_transaction(transaction_record, full_response, used_analysis, result, attempt_info, total_time)
+
             # Return simplified response if debug is False
             if not request.debug:
                 return self._create_simplified_response(full_response)
@@ -158,7 +238,10 @@ class IntelligentRouter:
                 message=f"All {len(sorted_analyses)} alternatives failed after retry attempts. Last error: {result.get('error', 'Unknown error')}",
                 evaluated_combinations=self._create_failure_summary(sorted_analyses, attempt_info)
             )
-            
+
+            # Log failed transaction
+            await self._log_failed_transaction(transaction_record, "all_alternatives_failed", full_response.message, total_time, attempt_info)
+
             # Return simplified response if debug is False
             if not request.debug:
                 return self._create_simplified_response(full_response)
@@ -170,9 +253,21 @@ class IntelligentRouter:
                    client_id=request.client_id,
                    scenario=request.scenario,
                    max_wait=request.max_wait_seconds)
-        
+
         start_time = time.time()
         request_id = str(uuid.uuid4())
+
+        # Create transaction record
+        transaction_logger = get_transaction_logger()
+        transaction_record = None
+        if transaction_logger:
+            transaction_record = transaction_logger.create_record(
+                request_id=request_id,
+                client_id=request.client_id,
+                routing_method="scenario"
+            )
+            transaction_record.scenario = request.scenario
+            transaction_record.max_wait_seconds = request.max_wait_seconds
         
         # Get scenario combinations
         scenario_combinations = self.config.get_scenario_combinations(request.scenario)
@@ -184,6 +279,10 @@ class IntelligentRouter:
                 error_code="scenario_not_found",
                 message=f"Scenario not found: {request.scenario}"
             )
+
+            # Log transaction failure
+            await self._log_failed_transaction(transaction_record, "scenario_not_found", full_response.message, time.time() - start_time)
+
             if not request.debug:
                 return self._create_simplified_response(full_response)
             return full_response
@@ -228,7 +327,10 @@ class IntelligentRouter:
                 response=result["response"],
                 metadata=self._create_metadata_with_attempts(used_analysis, analyses, total_time, attempt_info)
             )
-            
+
+            # Log successful transaction
+            await self._log_successful_transaction(transaction_record, full_response, used_analysis, result, attempt_info, total_time)
+
             if not request.debug:
                 return self._create_simplified_response(full_response)
             return full_response
@@ -240,7 +342,10 @@ class IntelligentRouter:
                 message=f"All {len(sorted_analyses)} scenario alternatives failed after retry attempts. Last error: {result.get('error', 'Unknown error')}",
                 evaluated_combinations=self._create_failure_summary(sorted_analyses, attempt_info)
             )
-            
+
+            # Log failed transaction
+            await self._log_failed_transaction(transaction_record, "all_alternatives_failed", full_response.message, total_time, attempt_info)
+
             if not request.debug:
                 return self._create_simplified_response(full_response)
             return full_response
@@ -252,9 +357,22 @@ class IntelligentRouter:
                    provider=request.provider,
                    model=request.model_name,
                    api_key_id=request.api_key_id)
-        
+
         start_time = time.time()
         request_id = str(uuid.uuid4())
+
+        # Create transaction record
+        transaction_logger = get_transaction_logger()
+        transaction_record = None
+        if transaction_logger:
+            transaction_record = transaction_logger.create_record(
+                request_id=request_id,
+                client_id=request.client_id,
+                routing_method="direct"
+            )
+            transaction_record.requested_provider = request.provider
+            transaction_record.requested_model = request.model_name
+            transaction_record.max_wait_seconds = request.max_wait_seconds
         
         # Validate provider and model
         if request.provider not in self.config.providers:
@@ -264,6 +382,10 @@ class IntelligentRouter:
                 error_code="provider_not_found",
                 message=f"Provider not found: {request.provider}"
             )
+
+            # Log transaction failure
+            await self._log_failed_transaction(transaction_record, "provider_not_found", full_response.message, time.time() - start_time)
+
             if not request.debug:
                 return self._create_simplified_response(full_response)
             return full_response
@@ -277,6 +399,10 @@ class IntelligentRouter:
                 error_code="model_not_found",
                 message=f"Model not found: {request.model_name}"
             )
+
+            # Log transaction failure
+            await self._log_failed_transaction(transaction_record, "model_not_found", full_response.message, time.time() - start_time)
+
             if not request.debug:
                 return self._create_simplified_response(full_response)
             return full_response
@@ -293,6 +419,10 @@ class IntelligentRouter:
                     error_code="api_key_not_found",
                     message=f"API key not found: {request.api_key_id}"
                 )
+
+                # Log transaction failure
+                await self._log_failed_transaction(transaction_record, "api_key_not_found", full_response.message, time.time() - start_time)
+
                 if not request.debug:
                     return self._create_simplified_response(full_response)
                 return full_response
@@ -338,7 +468,10 @@ class IntelligentRouter:
                 response=result["response"],
                 metadata=self._create_metadata_with_attempts(used_analysis, analyses, total_time, attempt_info)
             )
-            
+
+            # Log successful transaction
+            await self._log_successful_transaction(transaction_record, full_response, used_analysis, result, attempt_info, total_time)
+
             if not request.debug:
                 return self._create_simplified_response(full_response)
             return full_response
@@ -350,7 +483,10 @@ class IntelligentRouter:
                 message=f"All {len(sorted_analyses)} direct alternatives failed after retry attempts. Last error: {result.get('error', 'Unknown error')}",
                 evaluated_combinations=self._create_failure_summary(sorted_analyses, attempt_info)
             )
-            
+
+            # Log failed transaction
+            await self._log_failed_transaction(transaction_record, "all_alternatives_failed", full_response.message, total_time, attempt_info)
+
             if not request.debug:
                 return self._create_simplified_response(full_response)
             return full_response

@@ -14,6 +14,8 @@ from ..models.schemas import (
 )
 from typing import Union
 from .lifespan import lifespan, get_config_manager, get_rate_limit_manager, get_queue_manager, get_router
+from ..utils.transaction_logger import get_transaction_logger
+from ..utils.summary_stats import get_summary_stats_logger
 
 
 def create_app() -> FastAPI:
@@ -230,5 +232,72 @@ def create_app() -> FastAPI:
         rate_limit_manager = get_rate_limit_manager()
         rate_states = await rate_limit_manager.get_all_states()
         return {"rate_limit_states": rate_states}
+
+    # =============================================================================
+    # TRANSACTION STATISTICS ENDPOINTS
+    # =============================================================================
+
+    @app.get("/statistics/summary")
+    async def get_statistics_summary():
+        """Get transaction statistics summary"""
+        transaction_logger = get_transaction_logger()
+        if not transaction_logger:
+            return {"enabled": False, "message": "Transaction logging is disabled"}
+
+        stats = await transaction_logger.get_stats_summary()
+        return stats
+
+    @app.get("/statistics/status")
+    async def get_statistics_status():
+        """Get transaction logging status"""
+        transaction_logger = get_transaction_logger()
+        summary_logger = get_summary_stats_logger()
+
+        return {
+            "transaction_logging": {
+                "enabled": transaction_logger.enabled if transaction_logger else False,
+                "log_file": str(transaction_logger.csv_file) if transaction_logger else None,
+                "log_directory": str(transaction_logger.log_dir) if transaction_logger else None
+            },
+            "summary_stats": {
+                "enabled": summary_logger.enabled if summary_logger else False,
+                "stats_file": str(summary_logger.stats_file) if summary_logger else None,
+                "log_directory": str(summary_logger.log_dir) if summary_logger else None
+            }
+        }
+
+    # =============================================================================
+    # SUMMARY STATISTICS ENDPOINTS
+    # =============================================================================
+
+    @app.get("/statistics/daily/{date}")
+    async def get_daily_statistics(date: str):
+        """Get statistics for a specific date (YYYY-MM-DD format)"""
+        summary_logger = get_summary_stats_logger()
+        if not summary_logger:
+            return {"enabled": False, "message": "Summary statistics is disabled"}
+
+        stats = await summary_logger.get_daily_stats(date=date)
+        return stats
+
+    @app.get("/statistics/daily")
+    async def get_all_daily_statistics():
+        """Get statistics for all dates (daily pivot table)"""
+        summary_logger = get_summary_stats_logger()
+        if not summary_logger:
+            return {"enabled": False, "message": "Summary statistics is disabled"}
+
+        stats = await summary_logger.get_daily_stats()
+        return stats
+
+    @app.get("/statistics/aggregate")
+    async def get_aggregate_statistics():
+        """Get aggregated statistics across all days"""
+        summary_logger = get_summary_stats_logger()
+        if not summary_logger:
+            return {"enabled": False, "message": "Summary statistics is disabled"}
+
+        stats = await summary_logger.get_aggregate_stats()
+        return stats
 
     return app

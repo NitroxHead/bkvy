@@ -11,6 +11,8 @@ from ..core.queues import QueueManager
 from ..core.llm_client import LLMClient
 from ..core.router import IntelligentRouter
 from ..utils.logging import setup_logging
+from ..utils.transaction_logger import init_transaction_logger
+from ..utils.summary_stats import init_summary_stats_logger
 
 logger = setup_logging()
 
@@ -36,16 +38,40 @@ async def lifespan(app: FastAPI):
         rate_limit_manager = RateLimitManager()
         queue_manager = QueueManager()
         llm_client = LLMClient()
-        
+
         # Load configurations
         await config_manager.load_configs()
-        
+
+        # Initialize logging (both systems can be independently enabled/disabled)
+        import os
+        log_dir = os.getenv("LOG_DIR", "logs")
+
+        # Detailed transaction logging (CSV with full request details)
+        transaction_logging_enabled = os.getenv("TRANSACTION_LOGGING", "false").lower() == "true"
+        transaction_logger = init_transaction_logger(
+            enabled=transaction_logging_enabled,
+            log_dir=log_dir
+        )
+        logger.info("Transaction logging initialized",
+                   enabled=transaction_logging_enabled,
+                   log_dir=log_dir)
+
+        # Summary statistics logging (JSON with daily aggregates)
+        summary_stats_enabled = os.getenv("SUMMARY_STATS", "false").lower() == "true"
+        summary_stats_logger = init_summary_stats_logger(
+            enabled=summary_stats_enabled,
+            log_dir=log_dir
+        )
+        logger.info("Summary stats logging initialized",
+                   enabled=summary_stats_enabled,
+                   log_dir=log_dir)
+
         # Start LLM client
         await llm_client.start()
-        
+
         # Initialize router with all dependencies
         router = IntelligentRouter(config_manager, rate_limit_manager, queue_manager, llm_client)
-        
+
         logger.info("bkvy application started successfully")
         
     except Exception as e:
