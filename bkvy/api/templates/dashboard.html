@@ -585,6 +585,12 @@
                         </div>
                     </div>
                     <div class="chart-card">
+                        <h2>Client Distribution</h2>
+                        <div class="chart-container">
+                            <canvas id="clientChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="chart-card">
                         <h2>Wait Time Analysis</h2>
                         <div class="chart-container">
                             <canvas id="waitTimeChart"></canvas>
@@ -795,6 +801,7 @@
             updateProviderChart(data.distributions?.providers || {});
             updateIntelligenceChart(data.distributions?.intelligence_levels || {});
             updateRoutingChart(data.distributions?.routing_methods || {});
+            updateClientChart(data.distributions?.clients || {});
             updateWaitTimeChart(data.wait_time_analysis || []);
 
             updateApiKeysTable(data.api_keys || []);
@@ -963,12 +970,51 @@
             const data = Object.values(routing);
 
             charts.routing = new Chart(ctx, {
-                type: 'pie',
+                type: 'doughnut',
                 data: {
                     labels: labels,
                     datasets: [{
                         data: data,
                         backgroundColor: colors.chartColors.slice(0, 3),
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: colors.text,
+                                font: { size: 12 },
+                                usePointStyle: true,
+                                padding: 16
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateClientChart(clients) {
+            const ctx = document.getElementById('clientChart').getContext('2d');
+            const colors = getChartColors();
+
+            if (charts.client) {
+                charts.client.destroy();
+            }
+
+            const labels = Object.keys(clients);
+            const data = Object.values(clients);
+
+            charts.client = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: colors.chartColors,
                         borderWidth: 0
                     }]
                 },

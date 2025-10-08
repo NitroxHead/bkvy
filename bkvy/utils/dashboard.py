@@ -104,8 +104,23 @@ class DashboardDataProcessor:
             error_types = defaultdict(int)
             error_details = []
 
-            # Time series (hourly buckets)
-            time_series = defaultdict(lambda: {"success": 0, "failed": 0, "cost": 0.0})
+            # Time series (fixed number of buckets for consistent visualization)
+            NUM_TIME_BUCKETS = 24
+            time_range = (end_time - cutoff_time).total_seconds()
+            bucket_duration = time_range / NUM_TIME_BUCKETS
+            time_series_buckets = []
+
+            for i in range(NUM_TIME_BUCKETS):
+                bucket_start = cutoff_time + timedelta(seconds=i * bucket_duration)
+                bucket_end = cutoff_time + timedelta(seconds=(i + 1) * bucket_duration)
+                time_series_buckets.append({
+                    "start": bucket_start,
+                    "end": bucket_end,
+                    "label": bucket_start.strftime('%Y-%m-%d %H:%M'),
+                    "success": 0,
+                    "failed": 0,
+                    "cost": 0.0
+                })
 
             # Recent transactions
             recent_transactions = []
@@ -220,13 +235,15 @@ class DashboardDataProcessor:
                             "model": row.get('requested_model') or row.get('model_used', '')
                         })
 
-                    # Time series (hourly buckets)
-                    hour_key = timestamp.strftime('%Y-%m-%d %H:00')
-                    if is_success:
-                        time_series[hour_key]["success"] += 1
-                    else:
-                        time_series[hour_key]["failed"] += 1
-                    time_series[hour_key]["cost"] += cost
+                    # Time series (find appropriate bucket)
+                    for bucket in time_series_buckets:
+                        if bucket["start"] <= timestamp < bucket["end"]:
+                            if is_success:
+                                bucket["success"] += 1
+                            else:
+                                bucket["failed"] += 1
+                            bucket["cost"] += cost
+                            break
 
                     # API Key usage tracking
                     if row.get('api_key_used'):
@@ -304,15 +321,15 @@ class DashboardDataProcessor:
                             "output_tokens": row.get('output_tokens', '')
                         })
 
-            # Sort time series
+            # Format time series data
             sorted_time_series = []
-            for hour in sorted(time_series.keys()):
+            for bucket in time_series_buckets:
                 sorted_time_series.append({
-                    "hour": hour,
-                    "success": time_series[hour]["success"],
-                    "failed": time_series[hour]["failed"],
-                    "total": time_series[hour]["success"] + time_series[hour]["failed"],
-                    "cost": round(time_series[hour]["cost"], 6)
+                    "hour": bucket["label"],
+                    "success": bucket["success"],
+                    "failed": bucket["failed"],
+                    "total": bucket["success"] + bucket["failed"],
+                    "cost": round(bucket["cost"], 6)
                 })
 
             # Reverse recent transactions (newest first)
@@ -346,7 +363,9 @@ class DashboardDataProcessor:
                     data_coverage_warning = f"No data available for the requested period. Available data: {earliest_timestamp.strftime('%Y-%m-%d')} to {latest_timestamp.strftime('%Y-%m-%d')}."
             elif total_requests > 0 and earliest_timestamp and latest_timestamp:
                 # We have some data, but check if it's partial coverage
-                if cutoff_time < earliest_timestamp or end_time > latest_timestamp:
+                # Allow 5 minute tolerance to avoid warnings for minor timing differences
+                tolerance = timedelta(minutes=5)
+                if (cutoff_time + tolerance) < earliest_timestamp or (end_time - tolerance) > latest_timestamp:
                     actual_start = max(cutoff_time, earliest_timestamp).strftime('%Y-%m-%d %H:%M UTC')
                     actual_end = min(end_time, latest_timestamp).strftime('%Y-%m-%d %H:%M UTC')
                     data_coverage_warning = f"Partial data coverage. Showing data from {actual_start} to {actual_end}."
