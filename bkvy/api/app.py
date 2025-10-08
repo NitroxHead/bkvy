@@ -2,11 +2,14 @@
 FastAPI application and endpoints for bkvy
 """
 
+import os
 from datetime import datetime, timezone
 from typing import Dict, Any
+from pathlib import Path
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 from ..models.enums import IntelligenceLevel
 from ..models.schemas import (
@@ -14,8 +17,10 @@ from ..models.schemas import (
 )
 from typing import Union
 from .lifespan import lifespan, get_config_manager, get_rate_limit_manager, get_queue_manager, get_router
+from .middleware import IPWhitelistMiddleware, parse_ip_list
 from ..utils.transaction_logger import get_transaction_logger
 from ..utils.summary_stats import get_summary_stats_logger
+from ..utils.dashboard import get_dashboard_processor
 
 
 def create_app() -> FastAPI:
@@ -37,6 +42,17 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Add IP whitelist middleware for dashboard (if enabled)
+    dashboard_enabled = os.getenv("DASHBOARD_ENABLED", "false").lower() == "true"
+    if dashboard_enabled:
+        dashboard_ips = os.getenv("DASHBOARD_ALLOWED_IPS", "127.0.0.1")
+        allowed_ips = parse_ip_list(dashboard_ips)
+        app.add_middleware(
+            IPWhitelistMiddleware,
+            allowed_ips=allowed_ips,
+            protected_paths=["/dashboard"]
+        )
 
     # =============================================================================
     # CORE ROUTING ENDPOINTS - SYNCHRONOUS
@@ -299,5 +315,72 @@ def create_app() -> FastAPI:
 
         stats = await summary_logger.get_aggregate_stats()
         return stats
+
+    # =============================================================================
+    # DASHBOARD ENDPOINTS
+    # =============================================================================
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def get_dashboard():
+        """Serve the dashboard HTML page (IP-restricted)"""
+        dashboard_enabled = os.getenv("DASHBOARD_ENABLED", "false").lower() == "true"
+        if not dashboard_enabled:
+            return HTMLResponse(
+                content="<h1>Dashboard Disabled</h1><p>Set DASHBOARD_ENABLED=true to enable the dashboard.</p>",
+                status_code=503
+            )
+
+        # Read and serve the dashboard HTML template
+        template_path = Path(__file__).parent / "templates" / "dashboard.html"
+
+        if not template_path.exists():
+            return HTMLResponse(
+                content="<h1>Dashboard Not Found</h1><p>Dashboard template is missing.</p>",
+                status_code=404
+            )
+
+        with open(template_path, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+
+        return HTMLResponse(content=html_content)
+
+    @app.get("/dashboard/data")
+    async def get_dashboard_data(
+        hours: int = Query(24, ge=1, le=8760),
+        start_date: str = Query(None, description="Start date (ISO format)"),
+        end_date: str = Query(None, description="End date (ISO format)"),
+        timezone_offset: int = Query(0, ge=-12, le=12, description="Timezone offset from UTC in hours")
+    ):
+        """Get dashboard data as JSON (IP-restricted)"""
+        dashboard_enabled = os.getenv("DASHBOARD_ENABLED", "false").lower() == "true"
+        if not dashboard_enabled:
+            return {"error": "Dashboard is disabled"}
+
+        dashboard_processor = get_dashboard_processor()
+        if not dashboard_processor:
+            return {"error": "Dashboard processor not initialized"}
+
+        data = await dashboard_processor.get_dashboard_data(
+            hours=hours,
+            start_date=start_date,
+            end_date=end_date,
+            timezone_offset=timezone_offset
+        )
+        return data
+
+    @app.get("/dashboard/health")
+    async def get_dashboard_health():
+        """Get dashboard system health information (IP-restricted)"""
+        dashboard_enabled = os.getenv("DASHBOARD_ENABLED", "false").lower() == "true"
+        if not dashboard_enabled:
+            return {"enabled": False}
+
+        dashboard_processor = get_dashboard_processor()
+        if not dashboard_processor:
+            return {"enabled": True, "error": "Dashboard processor not initialized"}
+
+        health = await dashboard_processor.get_system_health()
+        health["enabled"] = True
+        return health
 
     return app

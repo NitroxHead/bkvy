@@ -89,3 +89,6 @@ test_refactored_results.json
 *.tmp
 *.temp
 .tmp/
+
+# Runtime state files
+rate_states/

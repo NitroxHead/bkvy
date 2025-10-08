@@ -45,17 +45,31 @@ bkvy/
 │   └── router.py           # Intelligent routing engine
 ├── api/                    # FastAPI application
 │   ├── app.py              # FastAPI endpoints
-│   └── lifespan.py         # Application lifecycle management
+│   ├── lifespan.py         # Application lifecycle management
+│   ├── middleware.py       # IP whitelist middleware for dashboard
+│   └── templates/          # HTML templates
+│       └── dashboard.html  # Dashboard UI
 └── utils/                  # Utility functions
     ├── logging.py          # Structured logging setup
     ├── transaction_logger.py  # Detailed CSV transaction logs
-    └── summary_stats.py    # Lightweight daily statistics
+    ├── summary_stats.py    # Lightweight daily statistics
+    └── dashboard.py        # Dashboard data processing
 
 main.py                     # Application entry point
 config/                     # Configuration files
 ├── providers.json          # API keys and model configs
 └── routing.json            # Scenario definitions
-logs/                       # Optional logging outputs
+docs/                       # Documentation
+├── API.md                  # API reference
+├── CONFIGURATION.md        # Configuration guide
+├── DASHBOARD.md            # Dashboard documentation
+├── EXAMPLES.md             # Usage examples
+└── SETUP.md                # Setup instructions
+tests/                      # Test files
+├── test_dashboard_sample_data.py
+├── test_transaction_logging.py
+└── test_load_low_intelligence.py
+logs/                       # Optional logging outputs (runtime)
 ├── transactions.csv        # Detailed request logs (if enabled)
 └── daily_stats.json        # Daily aggregated statistics (if enabled)
 ```
@@ -352,6 +366,38 @@ export SUMMARY_STATS=true
 - `GET /statistics/aggregate` - Aggregated stats across all days
 - `GET /statistics/daily/{date}` - Stats for specific date (YYYY-MM-DD)
 - `GET /statistics/daily` - All daily statistics (pivot table)
+
+## 📊 Web Dashboard
+
+bkvy includes an **optional browser-based dashboard** for visualizing transaction logs and system statistics with real-time charts and analytics.
+
+### Quick Start
+
+```bash
+# Enable the dashboard
+export DASHBOARD_ENABLED=true
+export TRANSACTION_LOGGING=true  # Required for dashboard data
+
+# Optional: Configure IP access control
+export DASHBOARD_ALLOWED_IPS="127.0.0.1"  # Local only (default)
+
+# Access the dashboard
+# http://localhost:10006/dashboard
+```
+
+### Key Features
+
+- **📈 Real-time Statistics**: Requests, success rates, costs, response times (P95/P99)
+- **📊 Interactive Charts**: Time-series, provider/model distributions, wait time analysis
+- **📝 Transaction History**: Recent requests with full details
+- **🔑 API Key Analytics**: Per-key usage, costs, and performance metrics
+- **⚠️ Error Analysis**: Error tracking and failure patterns
+- **🎨 Dark/Light Mode**: Automatic theme detection
+- **🔄 Auto-refresh**: 15s, 30s, 1m, 5m intervals
+- **📅 Custom Date Ranges**: Flexible time range selection (1h - 365d)
+- **🔒 IP Access Control**: Whitelist-based security
+
+**For complete documentation, see [docs/DASHBOARD.md](docs/DASHBOARD.md)**
 
 ## 🛠️ Advanced Features
 

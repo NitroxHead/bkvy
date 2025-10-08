@@ -13,6 +13,7 @@ from ..core.router import IntelligentRouter
 from ..utils.logging import setup_logging
 from ..utils.transaction_logger import init_transaction_logger
 from ..utils.summary_stats import init_summary_stats_logger
+from ..utils.dashboard import init_dashboard_processor
 
 logger = setup_logging()
 
@@ -22,12 +23,13 @@ rate_limit_manager = None
 queue_manager = None
 llm_client = None
 router = None
+dashboard_processor = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown"""
-    global config_manager, rate_limit_manager, queue_manager, llm_client, router
+    global config_manager, rate_limit_manager, queue_manager, llm_client, router, dashboard_processor
     
     # Startup
     logger.info("Starting bkvy application")
@@ -65,6 +67,18 @@ async def lifespan(app: FastAPI):
         logger.info("Summary stats logging initialized",
                    enabled=summary_stats_enabled,
                    log_dir=log_dir)
+
+        # Initialize dashboard processor
+        dashboard_enabled = os.getenv("DASHBOARD_ENABLED", "false").lower() == "true"
+        if dashboard_enabled:
+            dashboard_processor = init_dashboard_processor(log_dir=log_dir)
+            dashboard_ips = os.getenv("DASHBOARD_ALLOWED_IPS", "127.0.0.1")
+            logger.info("Dashboard initialized",
+                       enabled=dashboard_enabled,
+                       allowed_ips=dashboard_ips,
+                       log_dir=log_dir)
+        else:
+            logger.info("Dashboard disabled")
 
         # Start LLM client
         await llm_client.start()
