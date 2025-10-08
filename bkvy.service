@@ -17,6 +17,12 @@ Environment=WORKERS=1
 #Environment=TRANSACTION_LOGGING=true
 # Uncomment to enable summary statistics (JSON with daily aggregates, lightweight)
 #Environment=SUMMARY_STATS=true
+# Dashboard configuration
+# Uncomment to enable the dashboard (requires TRANSACTION_LOGGING=true)
+#Environment=DASHBOARD_ENABLED=true
+# Dashboard IP access control (comma-separated IPs, CIDR ranges, or wildcards)
+# Examples: "127.0.0.1" (local only), "10.0.0.0/24" (network), "all" (no restrictions)
+#Environment=DASHBOARD_ALLOWED_IPS=127.0.0.1
 ExecStart=/opt/bkvy/venv/bin/python main.py
 Restart=always
 RestartSec=5
