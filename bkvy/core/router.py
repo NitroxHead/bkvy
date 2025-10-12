@@ -24,12 +24,20 @@ logger = setup_logging()
 
 class IntelligentRouter:
     """Core routing engine with intelligent combination selection - NOW SYNCHRONOUS"""
-    
-    def __init__(self, config_manager, rate_limit_manager, queue_manager, llm_client):
+
+    def __init__(self, config_manager, rate_limit_manager, queue_manager, llm_client, circuit_breaker=None):
         self.config = config_manager
         self.rate_limits = rate_limit_manager
         self.queues = queue_manager
         self.llm_client = llm_client
+        self.circuit_breaker = circuit_breaker
+
+        # Import timeout manager
+        from ..core.timeout_manager import GlobalTimeoutManager
+        self.timeout_manager = GlobalTimeoutManager()
+
+        logger.info("Router initialized with circuit breaker and timeout manager",
+                   circuit_breaker_enabled=circuit_breaker.enabled if circuit_breaker else False)
 
     async def _log_transaction(self, record: TransactionRecord):
         """Log transaction to both detailed and summary loggers if available"""
@@ -164,16 +172,41 @@ class IntelligentRouter:
         # Analyze all combinations (use max_wait_seconds for route calculation only)
         logger.info("🔍 ANALYSIS DEBUG: Starting analysis of all combinations")
         analyses = await self._analyze_all_combinations(model_combinations, request.max_wait_seconds)
-        
-        logger.info("🔍 ANALYSIS DEBUG: Analysis complete", 
+
+        logger.info("🔍 ANALYSIS DEBUG: Analysis complete",
                    valid_analyses=len(analyses),
                    total_combinations=len(model_combinations))
-        
+
         if not analyses:
             return await self._create_failure_response(model_combinations, request.max_wait_seconds, "intelligence", request_id)
-        
-        # Sort by best combination (cheapest, then fastest)
-        sorted_analyses = sorted(analyses, key=lambda x: (x.cost_per_1k_tokens, x.total_seconds))
+
+        # Filter through circuit breaker
+        if self.circuit_breaker and self.circuit_breaker.enabled:
+            usable_analyses, blocked_analyses = await self.circuit_breaker.filter_alternatives(analyses)
+
+            logger.info("🔌 CIRCUIT BREAKER: Filtered alternatives",
+                       total=len(analyses),
+                       usable=len(usable_analyses),
+                       blocked=len(blocked_analyses))
+
+            if not usable_analyses:
+                full_response = LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="all_circuits_blocked",
+                    message=f"All {len(analyses)} alternatives are circuit-blocked",
+                    evaluated_combinations=blocked_analyses
+                )
+                await self._log_failed_transaction(transaction_record, "all_circuits_blocked", full_response.message, time.time() - start_time)
+
+                if not request.debug:
+                    return self._create_simplified_response(full_response)
+                return full_response
+
+            sorted_analyses = usable_analyses  # Already sorted by circuit breaker
+        else:
+            # Sort by best combination (cheapest, then fastest) if no circuit breaker
+            sorted_analyses = sorted(analyses, key=lambda x: (x.cost_per_1k_tokens, x.total_seconds))
         
         logger.info("🔍 SORTED DEBUG: All alternatives in order", 
                    alternatives_count=len(sorted_analyses),
@@ -192,7 +225,7 @@ class IntelligentRouter:
         # Try each alternative with retry logic - WITH EXCEPTION SAFETY
         try:
             result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-                sorted_analyses, request.messages, request.options
+                sorted_analyses, request.messages, request.options, start_time
             )
         except Exception as e:
             logger.error("💥 FATAL ERROR in retry logic", 
@@ -290,13 +323,38 @@ class IntelligentRouter:
         # Convert to (provider, model) tuples and analyze
         model_combinations = [(provider, model) for provider, model, _ in scenario_combinations]
         analyses = await self._analyze_all_combinations(model_combinations, request.max_wait_seconds)
-        
+
         if not analyses:
             return await self._create_failure_response(model_combinations, request.max_wait_seconds, "scenario", request_id)
-        
+
+        # Filter through circuit breaker
+        if self.circuit_breaker and self.circuit_breaker.enabled:
+            usable_analyses, blocked_analyses = await self.circuit_breaker.filter_alternatives(analyses)
+
+            logger.info("🔌 CIRCUIT BREAKER: Filtered scenario alternatives",
+                       total=len(analyses),
+                       usable=len(usable_analyses),
+                       blocked=len(blocked_analyses))
+
+            if not usable_analyses:
+                full_response = LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="all_circuits_blocked",
+                    message=f"All {len(analyses)} scenario alternatives are circuit-blocked",
+                    evaluated_combinations=blocked_analyses
+                )
+                await self._log_failed_transaction(transaction_record, "all_circuits_blocked", full_response.message, time.time() - start_time)
+
+                if not request.debug:
+                    return self._create_simplified_response(full_response)
+                return full_response
+
+            analyses = usable_analyses
+
         # Apply scenario priorities and sort
         priority_map = {(provider, model): priority for provider, model, priority in scenario_combinations}
-        
+
         # Sort by priority first, then cost, then time
         sorted_analyses = sorted(analyses, key=lambda x: (
             priority_map.get((x.provider, x.model), 999),
@@ -304,13 +362,13 @@ class IntelligentRouter:
             x.total_seconds
         ))
         
-        logger.info("Attempting scenario request with retry logic", 
+        logger.info("Attempting scenario request with retry logic",
                    scenario=request.scenario,
                    alternatives_count=len(sorted_analyses))
-        
+
         # Try each alternative with retry logic
         result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-            sorted_analyses, request.messages, request.options
+            sorted_analyses, request.messages, request.options, start_time
         )
         
         total_time = time.time() - start_time
@@ -435,23 +493,48 @@ class IntelligentRouter:
         analyses = await self._analyze_combinations_with_keys(
             model_combinations, api_keys_to_check, request.max_wait_seconds
         )
-        
+
         if not analyses:
             return await self._create_failure_response(
                 model_combinations, request.max_wait_seconds, "direct", request_id
             )
+
+        # Filter through circuit breaker
+        if self.circuit_breaker and self.circuit_breaker.enabled:
+            usable_analyses, blocked_analyses = await self.circuit_breaker.filter_alternatives(analyses)
+
+            logger.info("🔌 CIRCUIT BREAKER: Filtered direct alternatives",
+                       total=len(analyses),
+                       usable=len(usable_analyses),
+                       blocked=len(blocked_analyses))
+
+            if not usable_analyses:
+                full_response = LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="all_circuits_blocked",
+                    message=f"All {len(analyses)} direct alternatives are circuit-blocked",
+                    evaluated_combinations=blocked_analyses
+                )
+                await self._log_failed_transaction(transaction_record, "all_circuits_blocked", full_response.message, time.time() - start_time)
+
+                if not request.debug:
+                    return self._create_simplified_response(full_response)
+                return full_response
+
+            sorted_analyses = usable_analyses  # Already prioritized by circuit breaker
+        else:
+            # Sort by fastest completion time for direct requests if no circuit breaker
+            sorted_analyses = sorted(analyses, key=lambda x: x.total_seconds)
         
-        # Sort by fastest completion time for direct requests
-        sorted_analyses = sorted(analyses, key=lambda x: x.total_seconds)
-        
-        logger.info("Attempting direct request with retry logic", 
+        logger.info("Attempting direct request with retry logic",
                    provider=request.provider,
                    model=request.model_name,
                    alternatives_count=len(sorted_analyses))
-        
+
         # Try each alternative with retry logic
         result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-            sorted_analyses, request.messages, request.options
+            sorted_analyses, request.messages, request.options, start_time
         )
         
         total_time = time.time() - start_time
@@ -492,7 +575,8 @@ class IntelligentRouter:
             return full_response
     
     async def _execute_with_retry_and_fallback(self, sorted_analyses: List[CompletionTimeAnalysis],
-                                             messages: List[Message], options: Optional[LLMOptions]) -> Tuple[Dict[str, Any], CompletionTimeAnalysis, Dict[str, Any]]:
+                                             messages: List[Message], options: Optional[LLMOptions],
+                                             start_time: float = None) -> Tuple[Dict[str, Any], CompletionTimeAnalysis, Dict[str, Any]]:
         """Execute request with retry logic and automatic failover - enhanced error handling with 429 provider awareness"""
         MAX_RETRIES = 3
         attempt_info = {
@@ -500,16 +584,53 @@ class IntelligentRouter:
             "total_attempts": 0,
             "failures": []
         }
-        
+
+        # Track start time for global timeout
+        if start_time is None:
+            start_time = time.time()
+
+        escalated = False  # Track if we've escalated to fast mode
         current_alternatives = sorted_analyses[:]
         rate_limited_providers = set()  # Track providers that hit 429
-        
+        last_tried_provider = None
+
         while current_alternatives:
+            # Check global timeout
+            if self.timeout_manager.should_abort(start_time):
+                elapsed = time.time() - start_time
+                self.timeout_manager.log_timeout_abort(elapsed, attempt_info["alternatives_tried"])
+
+                return {
+                    "success": False,
+                    "error": f"Hard timeout exceeded ({elapsed:.1f}s) after {attempt_info['alternatives_tried']} alternatives"
+                }, sorted_analyses[0] if sorted_analyses else None, attempt_info
+
+            # Check if we should escalate to fast mode
+            if not escalated and self.timeout_manager.should_escalate(start_time):
+                escalated = True
+                elapsed = time.time() - start_time
+                self.timeout_manager.log_escalation(elapsed, attempt_info["alternatives_tried"])
+
+                # Reorder alternatives for speed (different provider, CLOSED circuits only)
+                if last_tried_provider:
+                    current_alternatives = self.timeout_manager.reorder_for_escalation(
+                        current_alternatives,
+                        last_tried_provider
+                    )
+
+                # Reduce MAX_RETRIES in escalated mode
+                MAX_RETRIES = 1
+
+                logger.warning("⏱️ ESCALATED TO FAST MODE",
+                             elapsed_seconds=elapsed,
+                             remaining_alternatives=len(current_alternatives),
+                             max_retries_reduced=MAX_RETRIES)
             # Get next alternative
             analysis = current_alternatives.pop(0)
             attempt_info["alternatives_tried"] += 1
-            
-            logger.info("Trying alternative", 
+            last_tried_provider = analysis.provider
+
+            logger.info("Trying alternative",
                        alternative_num=attempt_info["alternatives_tried"],
                        provider=analysis.provider,
                        model=analysis.model,
@@ -528,27 +649,62 @@ class IntelligentRouter:
                 
                 try:
                     result = await self._execute_request(analysis, messages, options)
-                    
+
                     if result["success"]:
-                        logger.info("SUCCESS", 
+                        logger.info("SUCCESS",
                                    alternative=attempt_info["alternatives_tried"],
                                    retry=retry_attempt,
                                    provider=analysis.provider,
                                    model=analysis.model)
+
+                        # Record success with circuit breaker
+                        if self.circuit_breaker and self.circuit_breaker.enabled:
+                            response_time_ms = result.get("response_time_ms")
+                            await self.circuit_breaker.record_success(
+                                analysis.provider,
+                                analysis.model,
+                                analysis.api_key_id,
+                                response_time_ms
+                            )
+
                         return result, analysis, attempt_info
                     else:
                         # Check error handling strategy
                         error_msg = result.get("error", "Unknown error")
-                        error_strategy = self._should_skip_retries(error_msg)
-                        
-                        logger.warning("Attempt failed", 
+                        status_code = result.get("status_code")
+                        response_time_ms = result.get("response_time_ms")
+
+                        # Record failure with circuit breaker
+                        if self.circuit_breaker and self.circuit_breaker.enabled:
+                            should_skip_alt, should_skip_prov = await self.circuit_breaker.record_failure(
+                                analysis.provider,
+                                analysis.model,
+                                analysis.api_key_id,
+                                error_msg,
+                                status_code,
+                                response_time_ms,
+                                result.get("headers")
+                            )
+
+                            # Use circuit breaker's strategy
+                            if should_skip_prov:
+                                error_strategy = "skip_provider"
+                            elif should_skip_alt:
+                                error_strategy = "skip_alternative"
+                            else:
+                                error_strategy = "retry"
+                        else:
+                            # Fallback to old strategy if circuit breaker disabled
+                            error_strategy = self._should_skip_retries(error_msg)
+
+                        logger.warning("Attempt failed",
                                      alternative=attempt_info["alternatives_tried"],
                                      retry=retry_attempt,
                                      provider=analysis.provider,
                                      model=analysis.model,
                                      error=error_msg,
                                      strategy=error_strategy)
-                        
+
                         attempt_info["failures"].append({
                             "alternative": attempt_info["alternatives_tried"],
                             "retry": retry_attempt,
@@ -602,9 +758,31 @@ class IntelligentRouter:
                 except Exception as e:
                     # Unexpected error (not from API response)
                     error_msg = f"Unexpected error: {str(e)}"
-                    error_strategy = self._should_skip_retries(str(e))
-                    
-                    logger.error("Unexpected error during attempt", 
+
+                    # Record failure with circuit breaker
+                    if self.circuit_breaker and self.circuit_breaker.enabled:
+                        should_skip_alt, should_skip_prov = await self.circuit_breaker.record_failure(
+                            analysis.provider,
+                            analysis.model,
+                            analysis.api_key_id,
+                            error_msg,
+                            status_code=None,
+                            response_time_ms=None,
+                            response_headers=None
+                        )
+
+                        # Use circuit breaker's strategy
+                        if should_skip_prov:
+                            error_strategy = "skip_provider"
+                        elif should_skip_alt:
+                            error_strategy = "skip_alternative"
+                        else:
+                            error_strategy = "retry"
+                    else:
+                        # Fallback to old strategy if circuit breaker disabled
+                        error_strategy = self._should_skip_retries(str(e))
+
+                    logger.error("Unexpected error during attempt",
                                alternative=attempt_info["alternatives_tried"],
                                retry=retry_attempt,
                                provider=analysis.provider,
@@ -612,7 +790,7 @@ class IntelligentRouter:
                                error=error_msg,
                                strategy=error_strategy,
                                traceback=traceback.format_exc())
-                    
+
                     attempt_info["failures"].append({
                         "alternative": attempt_info["alternatives_tried"],
                         "retry": retry_attempt,

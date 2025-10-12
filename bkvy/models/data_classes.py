@@ -56,6 +56,9 @@ class CompletionTimeAnalysis:
     provider: str
     model: str
     api_key_id: str
+    # Circuit breaker annotations (added dynamically)
+    priority_penalty: int = 0
+    circuit_state: Optional[Any] = None  # CircuitStatus enum
 
 
 @dataclass
