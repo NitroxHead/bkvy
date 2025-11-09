@@ -719,3 +719,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [ ] Custom model fine-tuning routing
 - [ ] Docker implementation
 - [ ] Prompt caching optimization
+- [X] Dashboard support
