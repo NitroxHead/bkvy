@@ -1,0 +1,39 @@
+{
+  "scenarios": {
+    "low_intelligence_low_rate": [
+      {"provider": "gemini", "model": "gemini-2.5-flash", "priority": 1},
+      {"provider": "anthropic", "model": "claude-3-haiku-20240307", "priority": 2},
+      {"provider": "openai", "model": "gpt-4o-mini-2024-07-18", "priority": 3}
+    ],
+    "medium_intelligence_balanced": [
+      {"provider": "gemini", "model": "gemini-2.0-flash", "priority": 1},
+      {"provider": "anthropic", "model": "claude-3-sonnet-20240229", "priority": 2},
+      {"provider": "openai", "model": "gpt-4o-mini", "priority": 3}
+    ],
+    "high_intelligence_premium": [
+      {"provider": "anthropic", "model": "claude-3-opus-20240229", "priority": 1},
+      {"provider": "openai", "model": "gpt-4o", "priority": 2},
+      {"provider": "gemini", "model": "gemini-2.5-pro", "priority": 3}
+    ],
+    "reasoning_models": [
+      {"provider": "openai", "model": "o1-preview", "priority": 1},
+      {"provider": "anthropic", "model": "claude-3-opus-20240229", "priority": 2},
+      {"provider": "gemini", "model": "gemini-2.5-pro", "priority": 3}
+    ],
+    "gemini_only_fast": [
+      {"provider": "gemini", "model": "gemini-2.5-flash", "priority": 1},
+      {"provider": "gemini", "model": "gemini-2.0-flash", "priority": 2}
+    ],
+    "anthropic_preferred": [
+      {"provider": "anthropic", "model": "claude-3-haiku-20240307", "priority": 1},
+      {"provider": "anthropic", "model": "claude-3-sonnet-20240229", "priority": 2},
+      {"provider": "anthropic", "model": "claude-3-opus-20240229", "priority": 3}
+    ],
+    "cost_optimized_bulk": [
+      {"provider": "gemini", "model": "gemini-2.5-flash", "priority": 1},
+      {"provider": "gemini", "model": "gemini-2.0-flash", "priority": 2},
+      {"provider": "openai", "model": "gpt-4o-mini-2024-07-18", "priority": 3},
+      {"provider": "anthropic", "model": "claude-3-haiku-20240307", "priority": 4}
+    ]
+  }
+}

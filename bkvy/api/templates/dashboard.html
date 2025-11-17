@@ -1,0 +1,1259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>bkvy Dashboard - LLM Routing Statistics</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            /* Primary Color Palette */
+            --primary-blue-60: #1366ff;
+            --primary-blue-70: #0857eb;
+            --primary-blue-80: #0039a0;
+            --neutral-gray-10: #f5f5f5;
+            --neutral-gray-20: #e2e2e2;
+            --neutral-gray-30: #c8c8c8;
+            --neutral-gray-50: #8f8f8f;
+            --neutral-gray-70: #545454;
+            --neutral-gray-90: #282828;
+            --neutral-gray-100: #181818;
+            --base-white: #ffffff;
+            --success-green: #28a349;
+            --error-red: #dc2026;
+            --accent-purple: #8c41fe;
+            --accent-cyan: #1394ea;
+            --accent-teal: #00a09d;
+            --accent-magenta: #f05598;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg-page: var(--neutral-gray-100);
+                --bg-layer-01: var(--neutral-gray-90);
+                --bg-layer-02: #313131;
+                --text-primary: var(--neutral-gray-10);
+                --text-secondary: var(--neutral-gray-30);
+                --border-subtle: var(--neutral-gray-70);
+                --border-strong: var(--neutral-gray-50);
+                --link: #7aacff;
+                --focus: #7aacff;
+            }
+        }
+
+        @media (prefers-color-scheme: light) {
+            :root {
+                --bg-page: var(--neutral-gray-10);
+                --bg-layer-01: var(--base-white);
+                --bg-layer-02: var(--neutral-gray-10);
+                --text-primary: var(--neutral-gray-100);
+                --text-secondary: var(--neutral-gray-70);
+                --border-subtle: var(--neutral-gray-20);
+                --border-strong: var(--neutral-gray-30);
+                --link: var(--primary-blue-60);
+                --focus: var(--primary-blue-60);
+            }
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+            background: var(--bg-page);
+            color: var(--text-primary);
+            line-height: 1.5;
+            font-size: 14px;
+        }
+
+        .container {
+            max-width: 1584px;
+            margin: 0 auto;
+            padding: 0;
+        }
+
+        /* IBM Grid System */
+        header {
+            background: var(--bg-layer-01);
+            padding: 32px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 400;
+            letter-spacing: 0;
+            color: var(--text-primary);
+            margin: 0;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+            font-weight: 400;
+        }
+
+        .controls {
+            background: var(--bg-layer-01);
+            padding: 16px 32px;
+            border-bottom: 1px solid var(--border-subtle);
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            align-items: end;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .control-group label {
+            font-size: 12px;
+            font-weight: 400;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.32px;
+        }
+
+        select, button, input[type="date"], input[type="datetime-local"] {
+            height: 40px;
+            padding: 0 16px;
+            border: none;
+            border-bottom: 1px solid var(--neutral-gray-50);
+            background: transparent;
+            color: var(--text-primary);
+            font-size: 14px;
+            font-family: inherit;
+            transition: border-color 110ms;
+            outline: none;
+        }
+
+        select:focus, input[type="date"]:focus, input[type="datetime-local"]:focus {
+            border-bottom: 2px solid var(--primary-blue-60);
+        }
+
+        select:hover, input[type="date"]:hover, input[type="datetime-local"]:hover {
+            border-bottom: 1px solid var(--text-primary);
+        }
+
+        button {
+            background: var(--primary-blue-60);
+            color: var(--base-white);
+            border: none;
+            cursor: pointer;
+            font-weight: 400;
+            transition: background 110ms;
+        }
+
+        button:hover {
+            background: var(--primary-blue-70);
+        }
+
+        button:active {
+            background: var(--primary-blue-80);
+        }
+
+        .date-range-mode {
+            display: none;
+            grid-column: span 2;
+            gap: 16px;
+        }
+
+        .date-range-mode.active {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+        }
+
+        /* Stats Grid - IBM Carbon Data Viz */
+        .stats-section {
+            padding: 32px;
+            background: var(--bg-page);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1px;
+            background: var(--border-subtle);
+            border: 1px solid var(--border-subtle);
+        }
+
+        .stat-card {
+            background: var(--bg-layer-01);
+            padding: 24px;
+            min-height: 120px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .stat-card h3 {
+            font-size: 12px;
+            font-weight: 400;
+            text-transform: uppercase;
+            letter-spacing: 0.32px;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 42px;
+            font-weight: 300;
+            line-height: 1;
+            color: var(--text-primary);
+            margin: 8px 0;
+        }
+
+        .stat-subtitle {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 8px;
+        }
+
+        /* Charts Section */
+        .charts-section {
+            padding: 32px;
+            background: var(--bg-page);
+        }
+
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 1px;
+            background: var(--border-subtle);
+            border: 1px solid var(--border-subtle);
+        }
+
+        .chart-card {
+            background: var(--bg-layer-01);
+            padding: 24px;
+        }
+
+        .chart-card h2 {
+            font-size: 16px;
+            font-weight: 400;
+            color: var(--text-primary);
+            margin-bottom: 24px;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 300px;
+        }
+
+        /* Tables */
+        .table-section {
+            padding: 0 32px 32px 32px;
+            background: var(--bg-page);
+        }
+
+        .table-card {
+            background: var(--bg-layer-01);
+            border: 1px solid var(--border-subtle);
+            margin-bottom: 16px;
+        }
+
+        .table-card h2 {
+            font-size: 16px;
+            font-weight: 400;
+            color: var(--text-primary);
+            padding: 24px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .table-wrapper {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }
+
+        thead {
+            background: var(--bg-layer-02);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        th {
+            padding: 16px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.32px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        td {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-subtle);
+            color: var(--text-primary);
+        }
+
+        tbody tr:hover {
+            background: var(--bg-layer-02);
+        }
+
+        .status-success {
+            color: var(--success-green);
+            font-weight: 600;
+        }
+
+        .status-failed {
+            color: var(--error-red);
+            font-weight: 600;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            font-size: 12px;
+            font-weight: 400;
+            border-radius: 0;
+            text-transform: uppercase;
+            letter-spacing: 0.32px;
+        }
+
+        .badge-intelligence {
+            background: var(--primary-blue-60);
+            color: var(--base-white);
+        }
+
+        .badge-scenario {
+            background: var(--accent-purple);
+            color: var(--base-white);
+        }
+
+        .badge-direct {
+            background: var(--accent-cyan);
+            color: var(--base-white);
+        }
+
+        /* Notifications */
+        .loading {
+            text-align: center;
+            padding: 64px 32px;
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        .error {
+            background: var(--error-red);
+            color: var(--base-white);
+            padding: 16px 32px;
+            margin: 0;
+            border-left: 4px solid var(--neutral-gray-100);
+        }
+
+        .warning {
+            background: #fff3cd;
+            color: #856404;
+            padding: 16px 32px;
+            margin: 0;
+            border-left: 4px solid #ff832b;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .warning {
+                background: #3a3419;
+                color: #ffd966;
+                border-left: 4px solid #f1c21b;
+            }
+        }
+
+        .warning-icon {
+            font-size: 20px;
+        }
+
+        .info {
+            background: var(--primary-blue-60);
+            color: var(--base-white);
+            padding: 16px 32px;
+            margin: 0;
+            border-left: 4px solid var(--primary-blue-80);
+            font-size: 14px;
+        }
+
+        .last-updated {
+            text-align: right;
+            color: var(--text-secondary);
+            padding: 16px 32px;
+            font-size: 12px;
+            background: var(--bg-layer-01);
+            border-top: 1px solid var(--border-subtle);
+        }
+
+        @media (max-width: 1056px) {
+            .charts-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 672px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+
+            h1 {
+                font-size: 24px;
+            }
+
+            .controls {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-content">
+                <div>
+                    <h1>bkvy Dashboard</h1>
+                    <p class="subtitle">LLM Routing Statistics & Analytics</p>
+                </div>
+            </div>
+        </header>
+
+        <div class="controls">
+            <div class="control-group">
+                <label for="timeRangeMode">Mode</label>
+                <select id="timeRangeMode" onchange="toggleTimeRangeMode()">
+                    <option value="preset" selected>Preset Range</option>
+                    <option value="custom">Custom Dates</option>
+                </select>
+            </div>
+            <div class="control-group" id="presetRangeGroup">
+                <label for="timeRange">Time Range</label>
+                <select id="timeRange" onchange="changeTimeRange()">
+                    <option value="1">Last 1 Hour</option>
+                    <option value="6">Last 6 Hours</option>
+                    <option value="24" selected>Last 24 Hours</option>
+                    <option value="72">Last 3 Days</option>
+                    <option value="168">Last 7 Days</option>
+                    <option value="336">Last 14 Days</option>
+                    <option value="720">Last 30 Days</option>
+                    <option value="2160">Last 90 Days</option>
+                    <option value="4320">Last 180 Days</option>
+                    <option value="8760">Last 365 Days</option>
+                </select>
+            </div>
+            <div class="date-range-mode" id="customRangeGroup">
+                <div class="control-group">
+                    <label for="startDate">From</label>
+                    <input type="datetime-local" id="startDate" onchange="changeCustomDateRange()">
+                </div>
+                <div class="control-group">
+                    <label for="endDate">To</label>
+                    <input type="datetime-local" id="endDate" onchange="changeCustomDateRange()">
+                </div>
+            </div>
+            <div class="control-group">
+                <label for="timezone">Timezone</label>
+                <select id="timezone" onchange="changeTimezone()">
+                    <option value="auto" selected>Server Time (UTC)</option>
+                    <option value="-12">UTC-12</option>
+                    <option value="-11">UTC-11</option>
+                    <option value="-10">UTC-10</option>
+                    <option value="-9">UTC-9</option>
+                    <option value="-8">UTC-8</option>
+                    <option value="-7">UTC-7</option>
+                    <option value="-6">UTC-6</option>
+                    <option value="-5">UTC-5</option>
+                    <option value="-4">UTC-4</option>
+                    <option value="-3">UTC-3</option>
+                    <option value="-2">UTC-2</option>
+                    <option value="-1">UTC-1</option>
+                    <option value="0">UTC+0</option>
+                    <option value="1">UTC+1</option>
+                    <option value="2">UTC+2</option>
+                    <option value="3">UTC+3</option>
+                    <option value="4">UTC+4</option>
+                    <option value="5">UTC+5</option>
+                    <option value="6">UTC+6</option>
+                    <option value="7">UTC+7</option>
+                    <option value="8">UTC+8</option>
+                    <option value="9">UTC+9</option>
+                    <option value="10">UTC+10</option>
+                    <option value="11">UTC+11</option>
+                    <option value="12">UTC+12</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Auto-refresh</label>
+                <select id="refreshInterval" onchange="changeRefreshInterval()">
+                    <option value="0">Off</option>
+                    <option value="15">15 seconds</option>
+                    <option value="30" selected>30 seconds</option>
+                    <option value="60">1 minute</option>
+                    <option value="300">5 minutes</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>&nbsp;</label>
+                <button onclick="refreshData()">Refresh Now</button>
+            </div>
+        </div>
+
+        <div id="warning" class="warning" style="display: none;">
+            <span class="warning-icon">⚠</span>
+            <span id="warningMessage"></span>
+        </div>
+
+        <div id="loading" class="loading">Loading dashboard data...</div>
+        <div id="error" class="error" style="display: none;"></div>
+
+        <div id="content" style="display: none;">
+            <!-- Overview Stats -->
+            <div class="stats-section">
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <h3>Total Requests</h3>
+                        <div class="stat-value" id="totalRequests">0</div>
+                        <div class="stat-subtitle" id="timeWindow">Last 24 hours</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Success Rate</h3>
+                        <div class="stat-value" id="successRate">0%</div>
+                        <div class="stat-subtitle"><span id="successCount">0</span> successful</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Total Cost</h3>
+                        <div class="stat-value" id="totalCost">$0.00</div>
+                        <div class="stat-subtitle">Estimated</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Avg Response Time</h3>
+                        <div class="stat-value" id="avgTime">0ms</div>
+                        <div class="stat-subtitle">
+                            P95: <span id="p95Time">0ms</span> | P99: <span id="p99Time">0ms</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Wait Time Compliance</h3>
+                        <div class="stat-value" id="waitCompliance">0%</div>
+                        <div class="stat-subtitle">
+                            <span id="waitMet">0</span> met / <span id="waitExceeded">0</span> exceeded
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Charts -->
+            <div class="charts-section">
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h2>Requests Over Time</h2>
+                        <div class="chart-container">
+                            <canvas id="timeSeriesChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="chart-card">
+                        <h2>Provider Distribution</h2>
+                        <div class="chart-container">
+                            <canvas id="providerChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="chart-card">
+                        <h2>Intelligence Levels</h2>
+                        <div class="chart-container">
+                            <canvas id="intelligenceChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="chart-card">
+                        <h2>Routing Methods</h2>
+                        <div class="chart-container">
+                            <canvas id="routingChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="chart-card">
+                        <h2>Client Distribution</h2>
+                        <div class="chart-container">
+                            <canvas id="clientChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="chart-card">
+                        <h2>Wait Time Analysis</h2>
+                        <div class="chart-container">
+                            <canvas id="waitTimeChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tables -->
+            <div class="table-section">
+                <!-- API Key Usage Table -->
+                <div class="table-card" id="apiKeysSection">
+                    <h2>API Key Usage</h2>
+                    <div class="table-wrapper">
+                        <table id="apiKeysTable">
+                            <thead>
+                                <tr>
+                                    <th>API Key</th>
+                                    <th>Requests</th>
+                                    <th>Success Rate</th>
+                                    <th>Total Cost</th>
+                                    <th>Total Tokens</th>
+                                    <th>Avg Time</th>
+                                    <th>Models Used</th>
+                                </tr>
+                            </thead>
+                            <tbody id="apiKeysBody">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Recent Transactions Table -->
+                <div class="table-card">
+                    <h2>Recent Transactions</h2>
+                    <div class="table-wrapper">
+                        <table id="transactionsTable">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Client</th>
+                                    <th>Method</th>
+                                    <th>Intelligence</th>
+                                    <th>Max Wait</th>
+                                    <th>Provider</th>
+                                    <th>Model</th>
+                                    <th>API Key</th>
+                                    <th>Status</th>
+                                    <th>Time</th>
+                                    <th>Cost</th>
+                                    <th>Tokens</th>
+                                </tr>
+                            </thead>
+                            <tbody id="transactionsBody">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Error Details -->
+                <div class="table-card" id="errorSection" style="display: none;">
+                    <h2>Recent Errors</h2>
+                    <div class="table-wrapper">
+                        <table id="errorsTable">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Error Type</th>
+                                    <th>Provider</th>
+                                    <th>Model</th>
+                                    <th>Message</th>
+                                </tr>
+                            </thead>
+                            <tbody id="errorsBody">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="last-updated" id="lastUpdated"></div>
+    </div>
+
+    <script>
+        let charts = {};
+        let refreshTimer = null;
+        let currentMode = 'preset';
+        let currentTimezoneOffset = 0;
+
+        function isDarkMode() {
+            return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        }
+
+        function getChartColors() {
+            const dark = isDarkMode();
+            return {
+                text: dark ? '#f5f5f5' : '#181818',
+                grid: dark ? '#545454' : '#e2e2e2',
+                success: '#28a349',
+                failed: '#dc2026',
+                primary: '#1366ff',
+                secondary: '#8c41fe',
+                chartColors: dark
+                    ? ['#1366ff', '#8c41fe', '#1394ea', '#00a09d', '#f05598', '#ff8630', '#28a349', '#a768ff']
+                    : ['#1366ff', '#8c41fe', '#1394ea', '#00a09d', '#f05598', '#ff8630', '#28a349', '#a768ff']
+            };
+        }
+
+        if (window.matchMedia) {
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+                refreshData();
+            });
+        }
+
+        async function loadDashboardData(hours = 24, startDate = null, endDate = null) {
+            try {
+                let url = `/dashboard/data?hours=${hours}`;
+                if (startDate) {
+                    url += `&start_date=${encodeURIComponent(startDate)}`;
+                }
+                if (endDate) {
+                    url += `&end_date=${encodeURIComponent(endDate)}`;
+                }
+                url += `&timezone_offset=${currentTimezoneOffset}`;
+
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+
+                if (data.error) {
+                    showError(data.error);
+                    return;
+                }
+
+                updateDashboard(data);
+                hideLoading();
+
+            } catch (error) {
+                showError(`Failed to load dashboard data: ${error.message}`);
+            }
+        }
+
+        function toggleTimeRangeMode() {
+            const mode = document.getElementById('timeRangeMode').value;
+            currentMode = mode;
+
+            const presetGroup = document.getElementById('presetRangeGroup');
+            const customGroup = document.getElementById('customRangeGroup');
+
+            if (mode === 'custom') {
+                presetGroup.style.display = 'none';
+                customGroup.classList.add('active');
+
+                if (!document.getElementById('endDate').value) {
+                    const now = new Date();
+                    const yesterday = new Date(now - 24 * 60 * 60 * 1000);
+                    document.getElementById('endDate').value = now.toISOString().slice(0, 16);
+                    document.getElementById('startDate').value = yesterday.toISOString().slice(0, 16);
+                }
+                changeCustomDateRange();
+            } else {
+                presetGroup.style.display = 'flex';
+                customGroup.classList.remove('active');
+                changeTimeRange();
+            }
+        }
+
+        function changeCustomDateRange() {
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+
+            if (startDate && endDate) {
+                const start = new Date(startDate).toISOString();
+                const end = new Date(endDate).toISOString();
+                loadDashboardData(24, start, end);
+            }
+        }
+
+        function updateDashboard(data) {
+            const coverage = data.data_coverage || {};
+            const warningDiv = document.getElementById('warning');
+            const warningMessage = document.getElementById('warningMessage');
+
+            if (coverage.warning) {
+                warningMessage.textContent = coverage.warning;
+                warningDiv.style.display = 'flex';
+            } else {
+                warningDiv.style.display = 'none';
+            }
+
+            const overview = data.overview || {};
+            document.getElementById('totalRequests').textContent = overview.total_requests || 0;
+            document.getElementById('successRate').textContent = `${overview.success_rate || 0}%`;
+            document.getElementById('successCount').textContent = overview.successful_requests || 0;
+            document.getElementById('totalCost').textContent = `$${(overview.total_cost || 0).toFixed(6)}`;
+            document.getElementById('avgTime').textContent = `${overview.avg_response_time_ms || 0}ms`;
+            document.getElementById('p95Time').textContent = `${overview.p95_response_time_ms || 0}ms`;
+            document.getElementById('p99Time').textContent = `${overview.p99_response_time_ms || 0}ms`;
+            document.getElementById('waitCompliance').textContent = `${overview.wait_time_compliance_rate || 0}%`;
+            document.getElementById('waitMet').textContent = overview.wait_time_met || 0;
+            document.getElementById('waitExceeded').textContent = overview.wait_time_exceeded || 0;
+            document.getElementById('timeWindow').textContent = `Last ${overview.time_window_hours || 24} hours`;
+
+            updateTimeSeriesChart(data.time_series || []);
+            updateProviderChart(data.distributions?.providers || {});
+            updateIntelligenceChart(data.distributions?.intelligence_levels || {});
+            updateRoutingChart(data.distributions?.routing_methods || {});
+            updateClientChart(data.distributions?.clients || {});
+            updateWaitTimeChart(data.wait_time_analysis || []);
+
+            updateApiKeysTable(data.api_keys || []);
+            updateTransactionsTable(data.recent_transactions || []);
+            updateErrorsTable(data.errors?.details || []);
+
+            document.getElementById('lastUpdated').textContent =
+                `Last updated: ${new Date().toLocaleString()}`;
+        }
+
+        function updateTimeSeriesChart(timeSeriesData) {
+            const ctx = document.getElementById('timeSeriesChart').getContext('2d');
+            const colors = getChartColors();
+
+            if (charts.timeSeries) {
+                charts.timeSeries.destroy();
+            }
+
+            const labels = timeSeriesData.map(d => d.hour);
+            const successData = timeSeriesData.map(d => d.success);
+            const failedData = timeSeriesData.map(d => d.failed);
+
+            charts.timeSeries = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'Successful',
+                            data: successData,
+                            borderColor: colors.success,
+                            backgroundColor: colors.success + '20',
+                            tension: 0.1,
+                            borderWidth: 2
+                        },
+                        {
+                            label: 'Failed',
+                            data: failedData,
+                            borderColor: colors.failed,
+                            backgroundColor: colors.failed + '20',
+                            tension: 0.1,
+                            borderWidth: 2
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: colors.text,
+                                font: { size: 12 },
+                                usePointStyle: true,
+                                padding: 16
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            ticks: { color: colors.text },
+                            grid: { color: colors.grid }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            ticks: { color: colors.text },
+                            grid: { color: colors.grid }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateProviderChart(providers) {
+            const ctx = document.getElementById('providerChart').getContext('2d');
+            const colors = getChartColors();
+
+            if (charts.provider) {
+                charts.provider.destroy();
+            }
+
+            const labels = Object.keys(providers);
+            const data = Object.values(providers);
+
+            charts.provider = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: colors.chartColors,
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: colors.text,
+                                font: { size: 12 },
+                                usePointStyle: true,
+                                padding: 16
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateIntelligenceChart(intelligence) {
+            const ctx = document.getElementById('intelligenceChart').getContext('2d');
+            const colors = getChartColors();
+
+            if (charts.intelligence) {
+                charts.intelligence.destroy();
+            }
+
+            const labels = Object.keys(intelligence);
+            const data = Object.values(intelligence);
+
+            charts.intelligence = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Requests',
+                        data: data,
+                        backgroundColor: colors.primary,
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        x: {
+                            ticks: { color: colors.text },
+                            grid: { display: false }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            ticks: { color: colors.text },
+                            grid: { color: colors.grid }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateRoutingChart(routing) {
+            const ctx = document.getElementById('routingChart').getContext('2d');
+            const colors = getChartColors();
+
+            if (charts.routing) {
+                charts.routing.destroy();
+            }
+
+            const labels = Object.keys(routing);
+            const data = Object.values(routing);
+
+            charts.routing = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: colors.chartColors.slice(0, 3),
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: colors.text,
+                                font: { size: 12 },
+                                usePointStyle: true,
+                                padding: 16
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateClientChart(clients) {
+            const ctx = document.getElementById('clientChart').getContext('2d');
+            const colors = getChartColors();
+
+            if (charts.client) {
+                charts.client.destroy();
+            }
+
+            const labels = Object.keys(clients);
+            const data = Object.values(clients);
+
+            charts.client = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: colors.chartColors,
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: colors.text,
+                                font: { size: 12 },
+                                usePointStyle: true,
+                                padding: 16
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateWaitTimeChart(waitTimeData) {
+            const ctx = document.getElementById('waitTimeChart').getContext('2d');
+            const colors = getChartColors();
+
+            if (charts.waitTime) {
+                charts.waitTime.destroy();
+            }
+
+            const labels = waitTimeData.map(d => d.bucket);
+            const successData = waitTimeData.map(d => d.success);
+            const failedData = waitTimeData.map(d => d.failed);
+
+            charts.waitTime = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'Successful',
+                            data: successData,
+                            backgroundColor: colors.success,
+                            borderWidth: 0
+                        },
+                        {
+                            label: 'Failed',
+                            data: failedData,
+                            backgroundColor: colors.failed,
+                            borderWidth: 0
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                color: colors.text,
+                                font: { size: 12 },
+                                usePointStyle: true,
+                                padding: 16
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            stacked: true,
+                            ticks: { color: colors.text },
+                            grid: { display: false }
+                        },
+                        y: {
+                            stacked: true,
+                            beginAtZero: true,
+                            ticks: { color: colors.text },
+                            grid: { color: colors.grid }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateApiKeysTable(apiKeys) {
+            const tbody = document.getElementById('apiKeysBody');
+            tbody.innerHTML = '';
+
+            const apiKeysSection = document.getElementById('apiKeysSection');
+            if (apiKeys.length === 0) {
+                apiKeysSection.style.display = 'none';
+                return;
+            }
+
+            apiKeysSection.style.display = 'block';
+
+            apiKeys.forEach(key => {
+                const row = tbody.insertRow();
+
+                const models = Object.entries(key.models_used || {})
+                    .map(([model, count]) => `${model} (${count})`)
+                    .join(', ');
+
+                row.innerHTML = `
+                    <td>${key.api_key || '-'}</td>
+                    <td>${key.total_requests || 0}</td>
+                    <td class="${key.success_rate >= 90 ? 'status-success' : 'status-failed'}">
+                        ${key.success_rate || 0}%
+                    </td>
+                    <td>$${(key.total_cost || 0).toFixed(6)}</td>
+                    <td>${key.total_tokens || 0}</td>
+                    <td>${key.avg_response_time_ms || 0}ms</td>
+                    <td>${models || '-'}</td>
+                `;
+            });
+        }
+
+        function updateTransactionsTable(transactions) {
+            const tbody = document.getElementById('transactionsBody');
+            tbody.innerHTML = '';
+
+            transactions.forEach(tx => {
+                const row = tbody.insertRow();
+
+                const timestamp = new Date(tx.timestamp).toLocaleString();
+                const methodBadge = getBadgeClass(tx.routing_method);
+                const statusClass = tx.success ? 'status-success' : 'status-failed';
+                const tokens = tx.input_tokens && tx.output_tokens
+                    ? `${tx.input_tokens}/${tx.output_tokens}`
+                    : '-';
+
+                row.innerHTML = `
+                    <td>${timestamp}</td>
+                    <td>${tx.client_id || '-'}</td>
+                    <td><span class="badge ${methodBadge}">${tx.routing_method || '-'}</span></td>
+                    <td>${tx.intelligence_level || '-'}</td>
+                    <td>${tx.max_wait_seconds || '-'}s</td>
+                    <td>${tx.provider || '-'}</td>
+                    <td>${tx.model || '-'}</td>
+                    <td>${tx.api_key || '-'}</td>
+                    <td class="${statusClass}">${tx.success ? 'Success' : 'Failed'}</td>
+                    <td>${tx.total_time_ms || '-'}ms</td>
+                    <td>${tx.cost ? '$' + parseFloat(tx.cost).toFixed(6) : '-'}</td>
+                    <td>${tokens}</td>
+                `;
+            });
+        }
+
+        function updateErrorsTable(errors) {
+            const errorSection = document.getElementById('errorSection');
+            const tbody = document.getElementById('errorsBody');
+
+            if (errors.length === 0) {
+                errorSection.style.display = 'none';
+                return;
+            }
+
+            errorSection.style.display = 'block';
+            tbody.innerHTML = '';
+
+            errors.forEach(err => {
+                const row = tbody.insertRow();
+                const timestamp = new Date(err.timestamp).toLocaleString();
+
+                row.innerHTML = `
+                    <td>${timestamp}</td>
+                    <td>${err.error_type || '-'}</td>
+                    <td>${err.provider || '-'}</td>
+                    <td>${err.model || '-'}</td>
+                    <td>${err.error_message || '-'}</td>
+                `;
+            });
+        }
+
+        function getBadgeClass(method) {
+            if (method === 'intelligence') return 'badge-intelligence';
+            if (method === 'scenario') return 'badge-scenario';
+            if (method === 'direct') return 'badge-direct';
+            return '';
+        }
+
+        function hideLoading() {
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('content').style.display = 'block';
+        }
+
+        function showError(message) {
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('content').style.display = 'none';
+            document.getElementById('warning').style.display = 'none';
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+
+        function changeTimeRange() {
+            const hours = parseInt(document.getElementById('timeRange').value);
+            loadDashboardData(hours);
+        }
+
+        function changeTimezone() {
+            const tz = document.getElementById('timezone').value;
+            if (tz === 'auto') {
+                currentTimezoneOffset = 0;
+            } else {
+                currentTimezoneOffset = parseInt(tz);
+            }
+            if (currentMode === 'custom') {
+                changeCustomDateRange();
+            } else {
+                changeTimeRange();
+            }
+        }
+
+        function changeRefreshInterval() {
+            const interval = parseInt(document.getElementById('refreshInterval').value);
+
+            if (refreshTimer) {
+                clearInterval(refreshTimer);
+                refreshTimer = null;
+            }
+
+            if (interval > 0) {
+                refreshTimer = setInterval(() => {
+                    const hours = parseInt(document.getElementById('timeRange').value);
+                    loadDashboardData(hours);
+                }, interval * 1000);
+            }
+        }
+
+        function refreshData() {
+            const hours = parseInt(document.getElementById('timeRange').value);
+            loadDashboardData(hours);
+        }
+
+        window.addEventListener('load', () => {
+            loadDashboardData(24);
+            changeRefreshInterval();
+        });
+    </script>
+</body>
+</html>
