@@ -13,7 +13,8 @@ from fastapi.responses import HTMLResponse
 
 from ..models.enums import IntelligenceLevel
 from ..models.schemas import (
-    IntelligenceRequest, ScenarioRequest, DirectRequest, LLMResponse, SimplifiedResponse
+    IntelligenceRequest, ScenarioRequest, DirectRequest, LLMResponse, SimplifiedResponse,
+    VisionIntelligenceRequest, VisionScenarioRequest, VisionDirectRequest
 )
 from typing import Union
 from .lifespan import (
@@ -87,6 +88,37 @@ def create_app() -> FastAPI:
         router = get_router()
         background_tasks.add_task(config_manager.refresh_if_changed)
         return await router.route_direct_request(request)
+
+    # =============================================================================
+    # VISION/MULTIMODAL ROUTING ENDPOINTS - SYNCHRONOUS
+    # =============================================================================
+
+    @app.post("/llm/vision/intelligence", response_model=Union[LLMResponse, SimplifiedResponse])
+    async def route_vision_by_intelligence(request: VisionIntelligenceRequest,
+                                           background_tasks: BackgroundTasks):
+        """Route vision/multimodal request based on intelligence level (low/medium/high) - WAITS FOR RESPONSE"""
+        config_manager = get_config_manager()
+        router = get_router()
+        background_tasks.add_task(config_manager.refresh_if_changed)
+        return await router.route_vision_intelligence_request(request)
+
+    @app.post("/llm/vision/scenario", response_model=Union[LLMResponse, SimplifiedResponse])
+    async def route_vision_by_scenario(request: VisionScenarioRequest,
+                                       background_tasks: BackgroundTasks):
+        """Route vision/multimodal request based on predefined scenario - WAITS FOR RESPONSE"""
+        config_manager = get_config_manager()
+        router = get_router()
+        background_tasks.add_task(config_manager.refresh_if_changed)
+        return await router.route_vision_scenario_request(request)
+
+    @app.post("/llm/vision/direct", response_model=Union[LLMResponse, SimplifiedResponse])
+    async def route_vision_direct(request: VisionDirectRequest,
+                                  background_tasks: BackgroundTasks):
+        """Route vision/multimodal request to specific provider/model combination - WAITS FOR RESPONSE"""
+        config_manager = get_config_manager()
+        router = get_router()
+        background_tasks.add_task(config_manager.refresh_if_changed)
+        return await router.route_vision_direct_request(request)
 
     # =============================================================================
     # STATUS AND MONITORING ENDPOINTS

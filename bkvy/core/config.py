@@ -7,7 +7,7 @@ import aiofiles
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
-from ..models.data_classes import ProviderConfig, ProviderKey, ProviderModel
+from ..models.data_classes import ProviderConfig, ProviderKey, ProviderModel, VisionLimits
 from ..utils.logging import setup_logging
 
 logger = setup_logging()
@@ -56,13 +56,27 @@ class ConfigManager:
                 
                 models = {}
                 for model_name, model_data in provider_data.get("models", {}).items():
+                    # Parse vision limits if present
+                    vision_limits = None
+                    if "vision_limits" in model_data:
+                        limits_data = model_data["vision_limits"]
+                        vision_limits = VisionLimits(
+                            max_images_per_request=limits_data.get("max_images_per_request", 1),
+                            max_image_size_mb=limits_data.get("max_image_size_mb", 20),
+                            max_dimension=limits_data.get("max_dimension"),
+                            max_single_image_dimension=limits_data.get("max_single_image_dimension"),
+                            max_multi_image_dimension=limits_data.get("max_multi_image_dimension")
+                        )
+
                     models[model_name] = ProviderModel(
                         endpoint=model_data["endpoint"],
                         cost_per_1k_tokens=model_data["cost_per_1k_tokens"],
                         avg_response_time_ms=model_data["avg_response_time_ms"],
                         intelligence_tier=model_data["intelligence_tier"],
                         version=model_data.get("version"),
-                        supports_thinking=model_data.get("supports_thinking")
+                        supports_thinking=model_data.get("supports_thinking"),
+                        supports_vision=model_data.get("supports_vision", False),
+                        vision_limits=vision_limits
                     )
                 
                 self.providers[provider_name] = ProviderConfig(keys=keys, models=models)

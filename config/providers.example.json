@@ -24,21 +24,39 @@
         "cost_per_1k_tokens": 0.0,
         "avg_response_time_ms": 2000,
         "intelligence_tier": "low",
-        "supports_thinking": true
+        "supports_thinking": true,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 3600,
+          "max_image_size_mb": 20,
+          "max_dimension": 8000
+        }
       },
       "gemini-2.0-flash": {
         "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
         "cost_per_1k_tokens": 0.0,
         "avg_response_time_ms": 2500,
         "intelligence_tier": "medium",
-        "supports_thinking": true
+        "supports_thinking": true,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 3600,
+          "max_image_size_mb": 20,
+          "max_dimension": 8000
+        }
       },
       "gemini-2.5-pro": {
-        "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+        "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
         "cost_per_1k_tokens": 0.0,
         "avg_response_time_ms": 3000,
         "intelligence_tier": "high",
-        "supports_thinking": true
+        "supports_thinking": true,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 3600,
+          "max_image_size_mb": 20,
+          "max_dimension": 8000
+        }
       }
     }
   },
@@ -59,21 +77,36 @@
         "cost_per_1k_tokens": 0.00015,
         "avg_response_time_ms": 1500,
         "intelligence_tier": "low",
-        "supports_thinking": false
+        "supports_thinking": false,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 10,
+          "max_image_size_mb": 20
+        }
       },
       "gpt-4o-mini": {
         "endpoint": "https://api.openai.com/v1/chat/completions",
         "cost_per_1k_tokens": 0.00015,
         "avg_response_time_ms": 3000,
         "intelligence_tier": "medium",
-        "supports_thinking": false
+        "supports_thinking": false,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 10,
+          "max_image_size_mb": 20
+        }
       },
       "gpt-4o": {
         "endpoint": "https://api.openai.com/v1/chat/completions",
         "cost_per_1k_tokens": 0.0025,
         "avg_response_time_ms": 4500,
         "intelligence_tier": "high",
-        "supports_thinking": false
+        "supports_thinking": false,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 10,
+          "max_image_size_mb": 20
+        }
       },
       "o1-preview": {
         "endpoint": "https://api.openai.com/v1/responses",
@@ -102,7 +135,13 @@
         "cost_per_1k_tokens": 0.00025,
         "avg_response_time_ms": 1800,
         "intelligence_tier": "low",
-        "supports_thinking": false
+        "supports_thinking": false,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 20,
+          "max_image_size_mb": 5,
+          "max_dimension": 8000
+        }
       },
       "claude-3-sonnet-20240229": {
         "endpoint": "https://api.anthropic.com/v1/messages",
@@ -110,7 +149,13 @@
         "cost_per_1k_tokens": 0.003,
         "avg_response_time_ms": 2500,
         "intelligence_tier": "medium",
-        "supports_thinking": true
+        "supports_thinking": true,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 20,
+          "max_image_size_mb": 5,
+          "max_dimension": 8000
+        }
       },
       "claude-3-opus-20240229": {
         "endpoint": "https://api.anthropic.com/v1/messages",
@@ -118,7 +163,13 @@
         "cost_per_1k_tokens": 0.015,
         "avg_response_time_ms": 4000,
         "intelligence_tier": "high",
-        "supports_thinking": true
+        "supports_thinking": true,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 20,
+          "max_image_size_mb": 5,
+          "max_dimension": 8000
+        }
       }
     }
   },
@@ -130,7 +181,8 @@
           "gpt-oss:20b": {"rpm": 60, "rpd": 2000},
           "llama3.2:3b": {"rpm": 60, "rpd": 2000},
           "codellama:7b": {"rpm": 40, "rpd": 1500},
-          "mistral:7b": {"rpm": 40, "rpd": 1500}
+          "mistral:7b": {"rpm": 40, "rpd": 1500},
+          "llava:latest": {"rpm": 40, "rpd": 1500}
         }
       }
     },
@@ -162,6 +214,18 @@
         "avg_response_time_ms": 3000,
         "intelligence_tier": "medium",
         "supports_thinking": false
+      },
+      "llava:latest": {
+        "endpoint": "http://10.151.197.16:11434/api/chat",
+        "cost_per_1k_tokens": 0.0,
+        "avg_response_time_ms": 4000,
+        "intelligence_tier": "medium",
+        "supports_thinking": false,
+        "supports_vision": true,
+        "vision_limits": {
+          "max_images_per_request": 1,
+          "max_dimension": 1344
+        }
       }
     }
   }

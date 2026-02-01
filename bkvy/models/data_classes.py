@@ -62,6 +62,16 @@ class CompletionTimeAnalysis:
 
 
 @dataclass
+class VisionLimits:
+    """Vision capability limits for a model"""
+    max_images_per_request: int = 1
+    max_image_size_mb: int = 20
+    max_dimension: Optional[int] = None
+    max_single_image_dimension: Optional[int] = None
+    max_multi_image_dimension: Optional[int] = None
+
+
+@dataclass
 class ProviderModel:
     """Model configuration for a provider"""
     endpoint: str
@@ -70,6 +80,8 @@ class ProviderModel:
     intelligence_tier: str
     version: Optional[str] = None
     supports_thinking: Optional[bool] = None
+    supports_vision: Optional[bool] = False
+    vision_limits: Optional[VisionLimits] = None
 
 
 @dataclass

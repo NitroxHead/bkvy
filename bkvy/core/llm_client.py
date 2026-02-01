@@ -448,3 +448,422 @@ class LLMClient:
                 "finish_reason": finish_reason,
                 "raw_response": result
             }
+
+    # Vision/Multimodal Transformation Methods
+
+    def _transform_vision_messages_for_gemini(self, messages: List[Dict]) -> List[Dict]:
+        """Transform vision messages to Gemini format"""
+        contents = []
+        for msg in messages:
+            if msg["role"] == "system":
+                # System messages as first user message
+                contents.insert(0, {
+                    "parts": [{"text": f"System: {msg['content']}"}]
+                })
+            else:
+                parts = []
+                for block in msg["content"]:
+                    if block["type"] == "text":
+                        parts.append({"text": block["text"]})
+                    elif block["type"] == "image":
+                        source = block["source"]
+                        # Gemini only supports base64 (URLs should be converted in preprocessing)
+                        if source["type"] == "base64":
+                            parts.append({
+                                "inline_data": {
+                                    "mime_type": source["media_type"],
+                                    "data": source["data"]
+                                }
+                            })
+
+                role_name = "model" if msg["role"] == "assistant" else None
+                content_dict = {"parts": parts}
+                if role_name:
+                    content_dict["role"] = role_name
+                contents.append(content_dict)
+
+        return contents
+
+    def _transform_vision_messages_for_openai(self, messages: List[Dict]) -> List[Dict]:
+        """Transform vision messages to OpenAI format"""
+        openai_messages = []
+        for msg in messages:
+            content_blocks = []
+            for block in msg["content"]:
+                if block["type"] == "text":
+                    content_blocks.append({
+                        "type": "text",
+                        "text": block["text"]
+                    })
+                elif block["type"] == "image":
+                    source = block["source"]
+                    if source["type"] == "url":
+                        content_blocks.append({
+                            "type": "image_url",
+                            "image_url": {"url": source["url"]}
+                        })
+                    elif source["type"] == "base64":
+                        # Convert to data URI
+                        data_uri = f"data:{source['media_type']};base64,{source['data']}"
+                        content_blocks.append({
+                            "type": "image_url",
+                            "image_url": {"url": data_uri}
+                        })
+
+            openai_messages.append({
+                "role": msg["role"],
+                "content": content_blocks
+            })
+
+        return openai_messages
+
+    def _transform_vision_messages_for_anthropic(self, messages: List[Dict]) -> tuple:
+        """Transform vision messages to Anthropic format
+
+        Returns:
+            Tuple of (anthropic_messages, system_message)
+        """
+        anthropic_messages = []
+        system_message = None
+
+        for msg in messages:
+            if msg["role"] == "system":
+                # Extract text from system message
+                system_text = ""
+                for block in msg["content"]:
+                    if block["type"] == "text":
+                        system_text += block["text"]
+                system_message = system_text
+            else:
+                content_blocks = []
+                for block in msg["content"]:
+                    if block["type"] == "text":
+                        content_blocks.append({
+                            "type": "text",
+                            "text": block["text"]
+                        })
+                    elif block["type"] == "image":
+                        source = block["source"]
+                        # Anthropic only supports base64 (URLs should be converted in preprocessing)
+                        if source["type"] == "base64":
+                            content_blocks.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": source["media_type"],
+                                    "data": source["data"]
+                                }
+                            })
+
+                anthropic_messages.append({
+                    "role": msg["role"],
+                    "content": content_blocks
+                })
+
+        return anthropic_messages, system_message
+
+    def _transform_vision_messages_for_ollama(self, messages: List[Dict]) -> List[Dict]:
+        """Transform vision messages to Ollama format"""
+        ollama_messages = []
+        for msg in messages:
+            # Ollama uses separate images array
+            text_content = ""
+            images = []
+
+            for block in msg["content"]:
+                if block["type"] == "text":
+                    text_content += block["text"]
+                elif block["type"] == "image":
+                    source = block["source"]
+                    # Ollama only supports base64 (URLs should be converted in preprocessing)
+                    if source["type"] == "base64":
+                        images.append(source["data"])
+
+            message_dict = {
+                "role": msg["role"],
+                "content": text_content
+            }
+            if images:
+                message_dict["images"] = images
+
+            ollama_messages.append(message_dict)
+
+        return ollama_messages
+
+    # Vision API Call Methods
+
+    async def _make_vision_api_call(self, provider: str, model: str, api_key: str,
+                                   messages: List[Dict], options: Dict,
+                                   endpoint: str, version: Optional[str] = None) -> Dict[str, Any]:
+        """Make vision API call to specific provider"""
+
+        if provider == "gemini":
+            return await self._call_gemini_vision(endpoint, api_key, messages, options)
+        elif provider == "openai":
+            return await self._call_openai_vision(endpoint, api_key, model, messages, options)
+        elif provider == "anthropic":
+            return await self._call_anthropic_vision(endpoint, api_key, model, messages, options, version)
+        elif provider == "ollama":
+            return await self._call_ollama_vision(endpoint, api_key, model, messages, options)
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
+
+    async def _call_gemini_vision(self, endpoint: str, api_key: str,
+                                 messages: List[Dict], options: Dict) -> Dict[str, Any]:
+        """Call Gemini API with vision/multimodal content"""
+        # Transform messages to Gemini format
+        contents = self._transform_vision_messages_for_gemini(messages)
+
+        payload = {
+            "contents": contents
+        }
+
+        # Add generation config if options provided
+        if options:
+            generation_config = {}
+            if "max_tokens" in options and options["max_tokens"]:
+                generation_config["maxOutputTokens"] = options["max_tokens"]
+            if "temperature" in options and options["temperature"] is not None:
+                generation_config["temperature"] = options["temperature"]
+            if "top_p" in options and options["top_p"] is not None:
+                generation_config["topP"] = options["top_p"]
+            if "top_k" in options and options["top_k"] is not None:
+                generation_config["topK"] = options["top_k"]
+            if "stop" in options and options["stop"]:
+                generation_config["stopSequences"] = options["stop"]
+            if generation_config:
+                payload["generationConfig"] = generation_config
+
+        headers = {
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json"
+        }
+
+        # Call the same endpoint as text-only Gemini
+        async with self.session.post(endpoint, json=payload, headers=headers) as response:
+            result = await response.json()
+
+            if response.status != 200:
+                error_msg = result.get("error", {}).get("message", str(result))
+                raise Exception(f"Gemini vision API error: {error_msg}")
+
+            # Extract content from Gemini response
+            candidates = result.get("candidates", [])
+            if not candidates:
+                raise Exception("No candidates in Gemini vision response")
+
+            content_parts = candidates[0].get("content", {}).get("parts", [])
+            content = "".join(part.get("text", "") for part in content_parts if "text" in part)
+
+            # Extract usage info
+            usage_metadata = result.get("usageMetadata", {})
+            input_tokens = usage_metadata.get("promptTokenCount", 0)
+            output_tokens = usage_metadata.get("candidatesTokenCount", 0)
+            total_tokens = usage_metadata.get("totalTokenCount", input_tokens + output_tokens)
+
+            finish_reason = candidates[0].get("finishReason", "STOP")
+
+            return {
+                "content": content,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens
+                },
+                "finish_reason": finish_reason,
+                "raw_response": result
+            }
+
+    async def _call_openai_vision(self, endpoint: str, api_key: str, model: str,
+                                 messages: List[Dict], options: Dict) -> Dict[str, Any]:
+        """Call OpenAI API with vision/multimodal content"""
+        # Transform messages to OpenAI format
+        openai_messages = self._transform_vision_messages_for_openai(messages)
+
+        payload = {
+            "model": model,
+            "messages": openai_messages
+        }
+
+        # Add options
+        if options:
+            if "max_tokens" in options and options["max_tokens"]:
+                payload["max_tokens"] = options["max_tokens"]
+            if "temperature" in options and options["temperature"] is not None:
+                payload["temperature"] = options["temperature"]
+            if "top_p" in options and options["top_p"] is not None:
+                payload["top_p"] = options["top_p"]
+            if "stop" in options and options["stop"]:
+                payload["stop"] = options["stop"]
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with self.session.post(endpoint, json=payload, headers=headers) as response:
+            result = await response.json()
+
+            if response.status != 200:
+                error_msg = result.get("error", {}).get("message", str(result))
+                raise Exception(f"OpenAI vision API error: {error_msg}")
+
+            # Extract content from OpenAI response
+            choices = result.get("choices", [])
+            if not choices:
+                raise Exception("No choices in OpenAI vision response")
+
+            content = choices[0].get("message", {}).get("content", "")
+            finish_reason = choices[0].get("finish_reason", "stop")
+
+            # Extract usage info
+            usage = result.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+
+            return {
+                "content": content,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens
+                },
+                "finish_reason": finish_reason,
+                "raw_response": result
+            }
+
+    async def _call_anthropic_vision(self, endpoint: str, api_key: str, model: str,
+                                    messages: List[Dict], options: Dict,
+                                    version: Optional[str] = None) -> Dict[str, Any]:
+        """Call Anthropic API with vision/multimodal content"""
+        # Transform messages to Anthropic format
+        anthropic_messages, system_message = self._transform_vision_messages_for_anthropic(messages)
+
+        payload = {
+            "model": model,
+            "messages": anthropic_messages,
+            "max_tokens": options.get("max_tokens", 1024)
+        }
+
+        # Add system message if present
+        if system_message:
+            payload["system"] = system_message
+
+        # Add other options
+        if options:
+            if "temperature" in options and options["temperature"] is not None:
+                payload["temperature"] = options["temperature"]
+            if "top_p" in options and options["top_p"] is not None:
+                payload["top_p"] = options["top_p"]
+            if "top_k" in options and options["top_k"] is not None:
+                payload["top_k"] = options["top_k"]
+            if "stop" in options and options["stop"]:
+                payload["stop_sequences"] = options["stop"]
+
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": version or "2023-06-01",
+            "Content-Type": "application/json"
+        }
+
+        async with self.session.post(endpoint, json=payload, headers=headers) as response:
+            result = await response.json()
+
+            if response.status != 200:
+                error_type = result.get("error", {}).get("type", "unknown")
+                error_msg = result.get("error", {}).get("message", str(result))
+                raise Exception(f"Anthropic vision API error ({error_type}): {error_msg}")
+
+            # Extract content from Anthropic response
+            content_blocks = result.get("content", [])
+            content = "".join(block.get("text", "") for block in content_blocks if block.get("type") == "text")
+
+            finish_reason = result.get("stop_reason", "end_turn")
+
+            # Extract usage info
+            usage = result.get("usage", {})
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            total_tokens = input_tokens + output_tokens
+
+            return {
+                "content": content,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens
+                },
+                "finish_reason": finish_reason,
+                "raw_response": result
+            }
+
+    async def _call_ollama_vision(self, endpoint: str, api_key: str, model: str,
+                                 messages: List[Dict], options: Dict) -> Dict[str, Any]:
+        """Call Ollama API with vision/multimodal content"""
+        # Transform messages to Ollama format
+        ollama_messages = self._transform_vision_messages_for_ollama(messages)
+
+        payload = {
+            "model": model,
+            "messages": ollama_messages,
+            "stream": False
+        }
+
+        # Add options
+        if options:
+            ollama_options = {}
+            if "temperature" in options and options["temperature"] is not None:
+                ollama_options["temperature"] = options["temperature"]
+            if "top_p" in options and options["top_p"] is not None:
+                ollama_options["top_p"] = options["top_p"]
+            if "top_k" in options and options["top_k"] is not None:
+                ollama_options["top_k"] = options["top_k"]
+            if "stop" in options and options["stop"]:
+                ollama_options["stop"] = options["stop"]
+            if ollama_options:
+                payload["options"] = ollama_options
+
+        async with self.session.post(endpoint, json=payload) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"Ollama vision API error: {error_text}")
+
+            result = await response.json()
+
+            # Extract content from Ollama response
+            content = ""
+            finish_reason = "stop"
+
+            if "message" in result and isinstance(result["message"], dict):
+                message = result["message"]
+                if "content" in message:
+                    content = message["content"]
+
+            if "done_reason" in result:
+                finish_reason = result["done_reason"]
+
+            # Extract usage/token information
+            input_tokens = result.get("prompt_eval_count", 0)
+            output_tokens = result.get("eval_count", 0)
+            total_tokens = input_tokens + output_tokens
+
+            # Fallback token estimation if not provided
+            # Use transformed ollama_messages which have string content, not original messages
+            if input_tokens == 0:
+                input_tokens = sum(len(msg["content"].split()) for msg in ollama_messages)
+            if output_tokens == 0 and content:
+                output_tokens = len(content.split())
+            if total_tokens == 0:
+                total_tokens = input_tokens + output_tokens
+
+            return {
+                "content": content,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens
+                },
+                "finish_reason": finish_reason,
+                "raw_response": result
+            }

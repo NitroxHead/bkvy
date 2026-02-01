@@ -1196,3 +1196,456 @@ class IntelligentRouter:
             retry_suggestion=retry_suggestion,
             evaluated_combinations=evaluated_combinations
         )
+
+    # Vision/Multimodal Routing Methods
+
+    async def _preprocess_vision_messages(self, messages: List) -> List[Dict]:
+        """
+        Preprocess vision messages: fetch URLs, validate images
+
+        Converts all image URLs to base64 for consistent provider handling.
+        Validates all base64 images for format, size, and dimensions.
+
+        Returns:
+            List of preprocessed messages in dict format
+        """
+        from ..utils.image_processor import ImageFetcher, ImageValidator
+
+        processed = []
+        # Reuse the existing session from llm_client instead of creating a new one
+        if not self.llm_client.session:
+            raise RuntimeError("LLM client session not initialized")
+
+        session = self.llm_client.session
+        for msg in messages:
+            content_blocks = []
+            for block in msg.content:
+                if block.type == "text":
+                    content_blocks.append({
+                        "type": "text",
+                        "text": block.text
+                    })
+                elif block.type == "image":
+                    if block.source.type == "url":
+                        # Fetch URL and convert to base64
+                        base64_data, media_type, error = await ImageFetcher.fetch_url_to_base64(
+                            block.source.url, session
+                        )
+                        if error:
+                            raise ValueError(f"Image fetch failed for {block.source.url}: {error}")
+
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": base64_data
+                            }
+                        })
+                    else:  # base64
+                        # Validate base64 image
+                        valid, error = await ImageValidator.validate_base64_image(
+                            block.source.data, block.source.media_type
+                        )
+                        if not valid:
+                            raise ValueError(f"Image validation failed: {error}")
+
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": block.source.media_type,
+                                "data": block.source.data
+                            }
+                        })
+
+            processed.append({
+                "role": msg.role,
+                "content": content_blocks
+            })
+
+        return processed
+
+    def _get_vision_models_by_intelligence(self, intelligence_level: str) -> List[tuple]:
+        """
+        Get vision-capable models for intelligence level
+
+        Returns:
+            List of (provider, model) tuples that support vision
+        """
+        combinations = []
+        for provider, model in self.config.get_models_by_intelligence(intelligence_level):
+            if provider in self.config.providers:
+                provider_config = self.config.providers[provider]
+                if model in provider_config.models:
+                    model_config = provider_config.models[model]
+
+                    # Check if model supports vision
+                    if getattr(model_config, 'supports_vision', False):
+                        combinations.append((provider, model))
+
+        return combinations
+
+    def _validate_vision_request(self, messages: List[Dict], model_config) -> tuple:
+        """
+        Validate vision request against model capabilities
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not getattr(model_config, 'supports_vision', False):
+            return False, "Model does not support vision capabilities"
+
+        # Count images in messages
+        image_count = 0
+        for msg in messages:
+            for block in msg.get("content", []):
+                if block.get("type") == "image":
+                    image_count += 1
+
+        # Check for empty image list (vision request should have at least one image)
+        if image_count == 0:
+            logger.warning("Vision request contains no images - this may not be intentional")
+            # Don't fail validation, just warn - some models can handle text-only in vision mode
+
+        # Check vision limits
+        vision_limits = getattr(model_config, 'vision_limits', None)
+        if vision_limits:
+            max_images = getattr(vision_limits, 'max_images_per_request', 1)
+            if image_count > max_images:
+                return False, f"Image count {image_count} exceeds model limit {max_images}"
+
+        return True, None
+
+    async def route_vision_intelligence_request(self, request) -> LLMResponse:
+        """Route vision request based on intelligence level"""
+        request_id = str(uuid.uuid4())
+        logger.info("Vision intelligence routing started",
+                   request_id=request_id,
+                   intelligence_level=request.intelligence_level.value)
+
+        try:
+            # Preprocess images (fetch URLs, validate)
+            logger.info("Preprocessing vision messages", request_id=request_id)
+            processed_messages = await self._preprocess_vision_messages(request.messages)
+
+            # Get vision-capable models for intelligence level
+            vision_models = self._get_vision_models_by_intelligence(request.intelligence_level.value)
+
+            if not vision_models:
+                logger.warning("No vision models available",
+                             intelligence_level=request.intelligence_level.value)
+                return LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="no_vision_models_available",
+                    message=f"No vision-capable models for intelligence level: {request.intelligence_level.value}"
+                )
+
+            logger.info("Found vision models", count=len(vision_models), models=vision_models)
+
+            # Analyze all vision-capable combinations
+            analyses = []
+            for provider, model in vision_models:
+                if provider in self.config.providers:
+                    provider_config = self.config.providers[provider]
+                    model_config = provider_config.models.get(model)
+
+                    # Validate vision request
+                    valid, error = self._validate_vision_request(processed_messages, model_config)
+                    if not valid:
+                        logger.debug("Vision validation failed",
+                                   provider=provider, model=model, error=error)
+                        continue
+
+                    for api_key_id in provider_config.keys:
+                        analysis = await self._analyze_combination(
+                            provider, model, api_key_id, request.max_wait_seconds
+                        )
+                        if analysis:
+                            analyses.append(analysis)
+
+            if not analyses:
+                return await self._create_failure_response(
+                    vision_models, request.max_wait_seconds, "intelligence", request_id
+                )
+
+            # Sort by total completion time
+            analyses.sort(key=lambda x: (x.priority_penalty, x.total_seconds))
+            selected = analyses[0]
+
+            logger.info("Selected vision combination",
+                       provider=selected.provider,
+                       model=selected.model,
+                       total_time=selected.total_seconds)
+
+            # Execute vision request
+            result = await self._execute_llm_request_vision(
+                selected, request_id, processed_messages,
+                request.options.model_dump() if request.options else {},
+                request.debug
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error("Vision intelligence routing failed",
+                        request_id=request_id, error=str(e))
+            return LLMResponse(
+                success=False,
+                request_id=request_id,
+                error_code="vision_routing_error",
+                message=f"Vision routing failed: {str(e)}"
+            )
+
+    async def route_vision_scenario_request(self, request) -> LLMResponse:
+        """Route vision request based on scenario"""
+        request_id = str(uuid.uuid4())
+        logger.info("Vision scenario routing started",
+                   request_id=request_id,
+                   scenario=request.scenario)
+
+        try:
+            # Preprocess images
+            processed_messages = await self._preprocess_vision_messages(request.messages)
+
+            # Get scenario model priorities
+            if request.scenario not in self.config.routing_scenarios:
+                return LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="scenario_not_found",
+                    message=f"Scenario '{request.scenario}' not found in routing.json"
+                )
+
+            scenario_priorities = self.config.routing_scenarios[request.scenario]
+
+            # Filter for vision-capable models only
+            vision_combinations = []
+            for provider, model in scenario_priorities:
+                if provider in self.config.providers:
+                    provider_config = self.config.providers[provider]
+                    if model in provider_config.models:
+                        model_config = provider_config.models[model]
+                        if getattr(model_config, 'supports_vision', False):
+                            vision_combinations.append((provider, model))
+
+            if not vision_combinations:
+                return LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="no_vision_models_in_scenario",
+                    message=f"No vision-capable models in scenario '{request.scenario}'"
+                )
+
+            # Analyze vision-capable combinations
+            analyses = []
+            for provider, model in vision_combinations:
+                provider_config = self.config.providers[provider]
+                model_config = provider_config.models[model]
+
+                # Validate vision request
+                valid, error = self._validate_vision_request(processed_messages, model_config)
+                if not valid:
+                    continue
+
+                for api_key_id in provider_config.keys:
+                    analysis = await self._analyze_combination(
+                        provider, model, api_key_id, request.max_wait_seconds
+                    )
+                    if analysis:
+                        analyses.append(analysis)
+
+            if not analyses:
+                return await self._create_failure_response(
+                    vision_combinations, request.max_wait_seconds, "scenario", request_id
+                )
+
+            # Sort by total completion time
+            analyses.sort(key=lambda x: (x.priority_penalty, x.total_seconds))
+            selected = analyses[0]
+
+            # Execute vision request
+            result = await self._execute_llm_request_vision(
+                selected, request_id, processed_messages,
+                request.options.model_dump() if request.options else {},
+                request.debug
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error("Vision scenario routing failed",
+                        request_id=request_id, error=str(e))
+            return LLMResponse(
+                success=False,
+                request_id=request_id,
+                error_code="vision_scenario_error",
+                message=f"Vision scenario routing failed: {str(e)}"
+            )
+
+    async def route_vision_direct_request(self, request) -> LLMResponse:
+        """Route vision request to specific provider/model"""
+        request_id = str(uuid.uuid4())
+        logger.info("Vision direct routing started",
+                   request_id=request_id,
+                   provider=request.provider,
+                   model=request.model_name)
+
+        try:
+            # Preprocess images
+            processed_messages = await self._preprocess_vision_messages(request.messages)
+
+            # Validate provider and model
+            if request.provider not in self.config.providers:
+                return LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="provider_not_found",
+                    message=f"Provider '{request.provider}' not configured"
+                )
+
+            provider_config = self.config.providers[request.provider]
+            if request.model_name not in provider_config.models:
+                return LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="model_not_found",
+                    message=f"Model '{request.model_name}' not found for provider '{request.provider}'"
+                )
+
+            model_config = provider_config.models[request.model_name]
+
+            # Validate vision support
+            valid, error = self._validate_vision_request(processed_messages, model_config)
+            if not valid:
+                return LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="vision_not_supported",
+                    message=error
+                )
+
+            # Select API key
+            if request.api_key_id:
+                if request.api_key_id not in provider_config.keys:
+                    return LLMResponse(
+                        success=False,
+                        request_id=request_id,
+                        error_code="api_key_not_found",
+                        message=f"API key '{request.api_key_id}' not found"
+                    )
+                api_key_id = request.api_key_id
+            else:
+                # Auto-select first available key
+                api_key_id = list(provider_config.keys.keys())[0]
+
+            # Analyze combination
+            analysis = await self._analyze_combination(
+                request.provider, request.model_name, api_key_id, request.max_wait_seconds
+            )
+
+            if not analysis:
+                return LLMResponse(
+                    success=False,
+                    request_id=request_id,
+                    error_code="combination_unavailable",
+                    message="Requested combination is not available"
+                )
+
+            # Execute vision request
+            result = await self._execute_llm_request_vision(
+                analysis, request_id, processed_messages,
+                request.options.model_dump() if request.options else {},
+                request.debug
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error("Vision direct routing failed",
+                        request_id=request_id, error=str(e))
+            return LLMResponse(
+                success=False,
+                request_id=request_id,
+                error_code="vision_direct_error",
+                message=f"Vision direct routing failed: {str(e)}"
+            )
+
+    async def _execute_llm_request_vision(self, analysis: CompletionTimeAnalysis,
+                                        request_id: str, messages: List[Dict],
+                                        options: Dict, debug: bool) -> LLMResponse:
+        """Execute vision LLM request using selected combination"""
+        start_time = datetime.now(timezone.utc)
+
+        try:
+            # Get configuration
+            provider_config = self.config.providers[analysis.provider]
+            model_config = provider_config.models[analysis.model]
+            key_config = provider_config.keys[analysis.api_key_id]
+
+            # Wait for rate limits if needed
+            if analysis.rate_limit_wait_seconds > 0:
+                await asyncio.sleep(analysis.rate_limit_wait_seconds)
+
+            # Wait for queue if needed
+            if analysis.queue_wait_seconds > 0:
+                await asyncio.sleep(analysis.queue_wait_seconds)
+
+            # Make vision API call
+            api_start = datetime.now(timezone.utc)
+            result = await self.llm_client._make_vision_api_call(
+                provider=analysis.provider,
+                model=analysis.model,
+                api_key=key_config.api_key,
+                messages=messages,
+                options=options,
+                endpoint=model_config.endpoint,
+                version=model_config.version if hasattr(model_config, 'version') else None
+            )
+            api_end = datetime.now(timezone.utc)
+
+            # Calculate metrics
+            api_response_time_ms = int((api_end - api_start).total_seconds() * 1000)
+            total_time_ms = int((api_end - start_time).total_seconds() * 1000)
+
+            # Calculate cost
+            usage = result.get("usage", {})
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            cost_usd = ((input_tokens + output_tokens) / 1000) * model_config.cost_per_1k_tokens
+
+            # Build response
+            metadata = ResponseMetadata(
+                rate_limit_wait_ms=int(analysis.rate_limit_wait_seconds * 1000),
+                queue_wait_ms=int(analysis.queue_wait_seconds * 1000),
+                api_response_time_ms=api_response_time_ms,
+                total_completion_time_ms=total_time_ms,
+                cost_usd=cost_usd,
+                alternatives_considered=[]
+            )
+
+            return LLMResponse(
+                success=True,
+                request_id=request_id,
+                provider_used=analysis.provider,
+                model_used=analysis.model,
+                api_key_used=analysis.api_key_id,
+                routing_method=RoutingMethod.INTELLIGENCE,
+                decision_reason=f"Vision-capable model selected",
+                response=result,
+                metadata=metadata
+            )
+
+        except Exception as e:
+            logger.error("Vision LLM request execution failed",
+                        request_id=request_id,
+                        provider=analysis.provider,
+                        model=analysis.model,
+                        error=str(e))
+            return LLMResponse(
+                success=False,
+                request_id=request_id,
+                error_code="vision_execution_error",
+                message=f"Vision request execution failed: {str(e)}"
+            )
