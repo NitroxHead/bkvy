@@ -16,7 +16,10 @@ from ..models.schemas import (
     IntelligenceRequest, ScenarioRequest, DirectRequest, LLMResponse, SimplifiedResponse
 )
 from typing import Union
-from .lifespan import lifespan, get_config_manager, get_rate_limit_manager, get_queue_manager, get_router
+from .lifespan import (
+    lifespan, get_config_manager, get_rate_limit_manager, get_queue_manager,
+    get_router, get_circuit_breaker, get_health_probe
+)
 from .middleware import IPWhitelistMiddleware, parse_ip_list
 from ..utils.transaction_logger import get_transaction_logger
 from ..utils.summary_stats import get_summary_stats_logger
@@ -248,6 +251,107 @@ def create_app() -> FastAPI:
         rate_limit_manager = get_rate_limit_manager()
         rate_states = await rate_limit_manager.get_all_states()
         return {"rate_limit_states": rate_states}
+
+    # =============================================================================
+    # CIRCUIT BREAKER ENDPOINTS
+    # =============================================================================
+
+    @app.get("/circuits/status")
+    async def get_circuit_status():
+        """Get all circuit breaker states"""
+        circuit_breaker = get_circuit_breaker()
+        if not circuit_breaker or not circuit_breaker.enabled:
+            return {
+                "enabled": False,
+                "message": "Circuit breaker is disabled"
+            }
+
+        return {
+            "enabled": True,
+            "circuits": circuit_breaker.get_all_circuit_states(),
+            "total_circuits": len(circuit_breaker.circuits),
+            "open_circuits": sum(1 for c in circuit_breaker.circuits.values() if c.state.value == "open"),
+            "half_open_circuits": sum(1 for c in circuit_breaker.circuits.values() if c.state.value == "half_open"),
+            "closed_circuits": sum(1 for c in circuit_breaker.circuits.values() if c.state.value == "closed")
+        }
+
+    @app.get("/circuits/provider/{provider_name}")
+    async def get_provider_circuit_health(provider_name: str):
+        """Get circuit breaker health for a specific provider"""
+        circuit_breaker = get_circuit_breaker()
+        if not circuit_breaker or not circuit_breaker.enabled:
+            return {
+                "enabled": False,
+                "message": "Circuit breaker is disabled"
+            }
+
+        health = await circuit_breaker.get_provider_health(provider_name)
+        return health.to_dict()
+
+    @app.get("/circuits/{provider}/{model}/{api_key_id}")
+    async def get_specific_circuit(provider: str, model: str, api_key_id: str):
+        """Get specific circuit state"""
+        circuit_breaker = get_circuit_breaker()
+        if not circuit_breaker or not circuit_breaker.enabled:
+            return {
+                "enabled": False,
+                "message": "Circuit breaker is disabled"
+            }
+
+        circuit = circuit_breaker.get_circuit_state(provider, model, api_key_id)
+        if circuit:
+            return circuit
+        else:
+            return {
+                "error": "Circuit not found",
+                "provider": provider,
+                "model": model,
+                "api_key_id": api_key_id
+            }
+
+    @app.post("/circuits/reset/{provider}/{model}/{api_key_id}")
+    async def reset_circuit(provider: str, model: str, api_key_id: str):
+        """Manually reset a circuit (admin action)"""
+        circuit_breaker = get_circuit_breaker()
+        if not circuit_breaker or not circuit_breaker.enabled:
+            return {
+                "enabled": False,
+                "message": "Circuit breaker is disabled"
+            }
+
+        success = await circuit_breaker.reset_circuit(provider, model, api_key_id)
+        if success:
+            return {
+                "success": True,
+                "message": f"Circuit reset for {provider}/{model}/{api_key_id}"
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Circuit not found"
+            }
+
+    @app.get("/circuits/summary")
+    async def get_circuits_summary():
+        """Get summary of all providers' circuit health"""
+        circuit_breaker = get_circuit_breaker()
+        config_manager = get_config_manager()
+
+        if not circuit_breaker or not circuit_breaker.enabled:
+            return {
+                "enabled": False,
+                "message": "Circuit breaker is disabled"
+            }
+
+        summary = {}
+        for provider_name in config_manager.providers.keys():
+            health = await circuit_breaker.get_provider_health(provider_name)
+            summary[provider_name] = health.to_dict()
+
+        return {
+            "enabled": True,
+            "providers": summary
+        }
 
     # =============================================================================
     # TRANSACTION STATISTICS ENDPOINTS
