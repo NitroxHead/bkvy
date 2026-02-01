@@ -140,19 +140,26 @@ class HealthProbe:
             return (False, str(e))
 
     async def _probe_gemini(self, endpoint: str, api_key: str, model: str) -> Tuple[bool, str]:
-        """Probe Gemini using models endpoint (free check)"""
+        """Probe Gemini using actual generation endpoint (tests rate limits)"""
         try:
-            # Try to get model info (no cost)
-            model_check_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}?key={api_key}"
+            # Use the actual generation endpoint to test rate limits
+            # This costs tokens but accurately tests if we can make requests
+            payload = {
+                "contents": [{"parts": [{"text": "test"}]}],
+                "generationConfig": {"maxOutputTokens": 1}
+            }
+
+            # Add API key to endpoint
+            probe_url = f"{endpoint}?key={api_key}"
 
             timeout = aiohttp.ClientTimeout(total=self.probe_timeout_seconds)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(model_check_url) as response:
+                async with session.post(probe_url, json=payload) as response:
                     if response.status == 200:
                         return (True, "")
                     else:
                         error_text = await response.text()
-                        error = f"HTTP {response.status}: {error_text}"
+                        error = f"Gemini API error {response.status}: {error_text}"
                         return (False, error)
 
         except asyncio.TimeoutError:
@@ -353,9 +360,24 @@ class BackgroundProbeWorker:
 
     async def _worker_loop(self):
         """Main worker loop"""
+        check_counter = 0
+
         while self._running:
             try:
                 await self._probe_circuits()
+
+                # Every 6 iterations (1 minute if interval=10s), check for stuck locks
+                check_counter += 1
+                if check_counter % 6 == 0:
+                    stats = self.circuit_breaker.get_probe_lock_stats()
+
+                    if stats["stuck_probe_locks"] > 0:
+                        logger.error(
+                            "ALERT: Stuck probe locks detected",
+                            stuck_count=stats["stuck_probe_locks"],
+                            stuck_circuits=stats["stuck_circuits"]
+                        )
+
                 await asyncio.sleep(self.interval_seconds)
 
             except asyncio.CancelledError:
@@ -369,7 +391,45 @@ class BackgroundProbeWorker:
 
     async def _probe_circuits(self):
         """Probe circuits ready for testing"""
-        now = asyncio.get_event_loop().time()
+        from datetime import datetime, timezone
+        now_dt = datetime.now(timezone.utc)
+        probe_timeout_seconds = int(os.getenv("PROBE_LOCK_TIMEOUT_SECONDS", "300"))
+        stuck_circuits_cleared = 0
+
+        # First, clean up stuck HALF_OPEN circuits
+        for circuit in self.circuit_breaker.circuits.values():
+            if circuit.state == CircuitStatus.HALF_OPEN:
+                if circuit.test_probe_in_progress and circuit.test_probe_started_at:
+                    elapsed = (now_dt - circuit.test_probe_started_at).total_seconds()
+
+                    if elapsed > probe_timeout_seconds:
+                        logger.warning(
+                            "Background worker clearing stuck probe lock",
+                            provider=circuit.provider,
+                            model=circuit.model,
+                            api_key_id=circuit.api_key_id,
+                            elapsed_seconds=elapsed,
+                            state=circuit.state.value
+                        )
+
+                        # Clear stuck probe lock and reopen circuit for fresh backoff
+                        circuit.test_probe_in_progress = False
+                        circuit.test_probe_started_at = None
+
+                        # Reopen circuit to start fresh recovery cycle
+                        await self.circuit_breaker._open_circuit(
+                            circuit,
+                            circuit.last_failure_type or FailureType.UNKNOWN_ERROR,
+                            None
+                        )
+
+                        stuck_circuits_cleared += 1
+
+        if stuck_circuits_cleared > 0:
+            logger.info(
+                "Background worker cleared stuck probe locks",
+                count=stuck_circuits_cleared
+            )
 
         # Find circuits ready to test
         circuits_to_probe = []
@@ -418,6 +478,7 @@ class BackgroundProbeWorker:
         # Mark as in progress
         for circuit in circuits_to_probe:
             circuit.test_probe_in_progress = True
+            circuit.test_probe_started_at = now_dt
             circuit.record_state_change(CircuitStatus.HALF_OPEN, "background_probe")
 
         # Probe all circuits

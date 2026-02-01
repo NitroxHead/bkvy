@@ -84,6 +84,7 @@ class CircuitState:
 
     # Health probing
     test_probe_in_progress: bool = False
+    test_probe_started_at: Optional[datetime] = None
     health_probe_failures: int = 0
 
     # Performance tracking
@@ -272,7 +273,7 @@ class CircuitState:
         """Create from dictionary"""
         # Convert ISO format strings back to datetime
         for key in ['last_failure_time', 'last_success_time', 'next_test_time',
-                   'flapping_detected_at', 'created_at', 'updated_at']:
+                   'flapping_detected_at', 'created_at', 'updated_at', 'test_probe_started_at']:
             if key in data and data[key]:
                 data[key] = datetime.fromisoformat(data[key])
 

@@ -236,8 +236,14 @@ class FailureClassifier:
         # Try to extract from error message patterns
         error_lower = error_message.lower()
 
-        # Pattern: "retry after 60 seconds"
         import re
+
+        # Pattern: "Please retry in 43.217415972s" (Gemini format)
+        gemini_pattern = re.search(r'retry in ([\d.]+)s', error_lower)
+        if gemini_pattern:
+            return int(float(gemini_pattern.group(1)) + 1)  # Round up
+
+        # Pattern: "retry after 60 seconds"
         retry_pattern = re.search(r'retry after (\d+) seconds?', error_lower)
         if retry_pattern:
             return int(retry_pattern.group(1))

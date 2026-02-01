@@ -206,6 +206,10 @@ class CircuitBreakerManager:
         """Open a circuit and set recovery time"""
         previous_state = circuit.state
 
+        # Clear probe lock when reopening circuit (failed test probe)
+        circuit.test_probe_in_progress = False
+        circuit.test_probe_started_at = None
+
         # Record state change
         circuit.record_state_change(
             CircuitStatus.OPEN,
@@ -337,6 +341,7 @@ class CircuitBreakerManager:
         circuit.backoff_level = max(0, circuit.backoff_level - 1)  # Gradual backoff reduction
         circuit.next_test_time = None
         circuit.test_probe_in_progress = False
+        circuit.test_probe_started_at = None
         circuit.health_probe_failures = 0
 
         # Clear sliding window on successful recovery
@@ -391,8 +396,9 @@ class CircuitBreakerManager:
             if now >= circuit.next_test_time:
                 # Time to test - try to transition to HALF_OPEN
                 if not circuit.test_probe_in_progress:
-                    # Acquire test lock
+                    # Acquire test lock with timestamp
                     circuit.test_probe_in_progress = True
+                    circuit.test_probe_started_at = datetime.now(timezone.utc)
                     circuit.record_state_change(
                         CircuitStatus.HALF_OPEN,
                         "testing_recovery"
@@ -417,7 +423,31 @@ class CircuitBreakerManager:
 
         elif circuit.state == CircuitStatus.HALF_OPEN:
             if circuit.test_probe_in_progress:
-                # Probe in progress by another request
+                # Check if probe lock has timed out
+                now = datetime.now(timezone.utc)
+                probe_timeout_seconds = int(os.getenv("PROBE_LOCK_TIMEOUT_SECONDS", "300"))  # 5 min
+
+                if circuit.test_probe_started_at:
+                    elapsed = (now - circuit.test_probe_started_at).total_seconds()
+
+                    if elapsed > probe_timeout_seconds:
+                        # Probe lock timed out - clear it and allow testing
+                        logger.warning(
+                            "Probe lock timeout - clearing stuck lock",
+                            provider=provider,
+                            model=model,
+                            api_key_id=api_key_id,
+                            elapsed_seconds=elapsed,
+                            timeout_seconds=probe_timeout_seconds
+                        )
+
+                        circuit.test_probe_in_progress = False
+                        circuit.test_probe_started_at = None
+                        await self.persistence.save_state(circuit)
+
+                        return (True, 0, "testing_recovery_after_timeout")
+
+                # Probe still in progress within timeout
                 return (False, 2, "probe_in_progress")
             else:
                 # Allow testing
@@ -668,6 +698,7 @@ class CircuitBreakerManager:
             circuit.is_flapping = False
             circuit.priority_penalty = 0
             circuit.test_probe_in_progress = False
+            circuit.test_probe_started_at = None
 
             await self.persistence.save_state(circuit)
 
@@ -681,3 +712,33 @@ class CircuitBreakerManager:
             return True
 
         return False
+
+    def get_probe_lock_stats(self) -> dict:
+        """Get statistics about probe locks for monitoring"""
+        now = datetime.now(timezone.utc)
+        probe_timeout = int(os.getenv("PROBE_LOCK_TIMEOUT_SECONDS", "300"))
+
+        stats = {
+            "total_circuits": len(self.circuits),
+            "half_open_with_locks": 0,
+            "stuck_probe_locks": 0,
+            "stuck_circuits": []
+        }
+
+        for circuit in self.circuits.values():
+            if circuit.state == CircuitStatus.HALF_OPEN and circuit.test_probe_in_progress:
+                stats["half_open_with_locks"] += 1
+
+                if circuit.test_probe_started_at:
+                    elapsed = (now - circuit.test_probe_started_at).total_seconds()
+
+                    if elapsed > probe_timeout:
+                        stats["stuck_probe_locks"] += 1
+                        stats["stuck_circuits"].append({
+                            "provider": circuit.provider,
+                            "model": circuit.model,
+                            "api_key_id": circuit.api_key_id,
+                            "stuck_duration_seconds": elapsed
+                        })
+
+        return stats

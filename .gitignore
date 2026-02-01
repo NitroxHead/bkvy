@@ -92,3 +92,7 @@ test_refactored_results.json
 
 # Runtime state files
 rate_states/
+circuit_states/
+
+# Local service configuration (contains deployment-specific settings)
+bkvy.service
