@@ -25,6 +25,9 @@ from ..utils.transaction_logger import get_transaction_logger
 from ..utils.summary_stats import get_summary_stats_logger
 from ..utils.dashboard import get_dashboard_processor
 
+# Agent system routes
+from .agent_routes import router as agent_router, tools_router, mcp_router
+
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application"""
@@ -486,5 +489,14 @@ def create_app() -> FastAPI:
         health = await dashboard_processor.get_system_health()
         health["enabled"] = True
         return health
+
+    # =============================================================================
+    # AGENT SYSTEM ROUTES
+    # =============================================================================
+
+    # Include agent system routers
+    app.include_router(agent_router)
+    app.include_router(tools_router)
+    app.include_router(mcp_router)
 
     return app

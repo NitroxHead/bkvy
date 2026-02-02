@@ -1,0 +1,32 @@
+{
+  "settings": {
+    "default_timeout_seconds": 30,
+    "max_concurrent_tool_calls": 5
+  },
+  "builtin": {
+    "web_fetch": {
+      "enabled": true,
+      "timeout_seconds": 30,
+      "max_content_length": 50000
+    },
+    "web_search": {
+      "enabled": true,
+      "timeout_seconds": 30,
+      "default_num_results": 5,
+      "max_num_results": 10
+    }
+  },
+  "search_api": {
+    "provider": null,
+    "api_key_env": "SEARCH_API_KEY",
+    "providers": {
+      "serpapi": {
+        "base_url": "https://serpapi.com/search",
+        "engine": "google"
+      },
+      "brave": {
+        "base_url": "https://api.search.brave.com/res/v1/web/search"
+      }
+    }
+  }
+}

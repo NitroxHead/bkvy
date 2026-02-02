@@ -1,0 +1,44 @@
+{
+  "templates": {
+    "general": {
+      "name": "general",
+      "agent_type": "react",
+      "intelligence_level": "medium",
+      "max_iterations": 10,
+      "tools": ["web_fetch", "web_search"],
+      "system_prompt": null,
+      "temperature": null,
+      "max_tokens": null
+    },
+    "research": {
+      "name": "research",
+      "agent_type": "react",
+      "intelligence_level": "high",
+      "max_iterations": 15,
+      "tools": ["web_fetch", "web_search"],
+      "system_prompt": "You are a thorough research assistant. When gathering information, be comprehensive and cite your sources. Verify facts using multiple sources when possible.",
+      "temperature": 0.3,
+      "max_tokens": 4096
+    },
+    "simple": {
+      "name": "simple",
+      "agent_type": "function_calling",
+      "intelligence_level": "low",
+      "max_iterations": 5,
+      "tools": ["web_fetch"],
+      "system_prompt": null,
+      "temperature": 0.7,
+      "max_tokens": 1024
+    },
+    "assistant": {
+      "name": "assistant",
+      "agent_type": "function_calling",
+      "intelligence_level": "medium",
+      "max_iterations": 8,
+      "tools": ["web_fetch", "web_search"],
+      "system_prompt": "You are a helpful assistant. Answer questions accurately and concisely. Use tools to gather information when needed.",
+      "temperature": 0.5,
+      "max_tokens": 2048
+    }
+  }
+}
