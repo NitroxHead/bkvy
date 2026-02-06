@@ -189,7 +189,11 @@ class CircuitBreakerManager:
                     threshold=self.sliding_window_threshold
                 )
 
-        if should_open and circuit.state != CircuitStatus.OPEN:
+        if circuit.state == CircuitStatus.HALF_OPEN:
+            # Any failure during recovery testing means test failed — always reopen.
+            # should_circuit_break governs CLOSED→OPEN transitions, not HALF_OPEN→OPEN.
+            await self._open_circuit(circuit, failure_type, response_headers)
+        elif should_open and circuit.state != CircuitStatus.OPEN:
             await self._open_circuit(circuit, failure_type, response_headers)
 
         # Persist state
@@ -209,6 +213,7 @@ class CircuitBreakerManager:
         # Clear probe lock when reopening circuit (failed test probe)
         circuit.test_probe_in_progress = False
         circuit.test_probe_started_at = None
+        circuit.stable_since = None
 
         # Record state change
         circuit.record_state_change(
@@ -238,6 +243,7 @@ class CircuitBreakerManager:
 
         elif failure_type == FailureType.AUTH_ERROR_4XX:
             # Never auto-test auth errors
+            backoff = 0
             circuit.next_test_time = None
         else:
             # Exponential backoff for other errors
@@ -318,6 +324,10 @@ class CircuitBreakerManager:
             # Just sync the failure_count for consistency
             circuit.failure_count = circuit.get_failure_count_in_window(window_seconds=self.sliding_window_seconds)
 
+            # Check if flapping can be cleared (stable_since anchor set by _close_circuit)
+            if circuit.is_flapping:
+                await self._check_flapping_clear(circuit)
+
         # Persist state
         await self.persistence.save_state(circuit)
 
@@ -347,9 +357,10 @@ class CircuitBreakerManager:
         # Clear sliding window on successful recovery
         circuit.clear_failure_window()
 
-        # Clear flapping if circuit has been stable
-        if circuit.is_flapping:
-            await self._check_flapping_clear(circuit)
+        # Mark when circuit became stable (for flapping clearance timing)
+        circuit.stable_since = datetime.now(timezone.utc)
+        # Note: flapping is cleared by periodic probe worker check and
+        # record_success checks, using stable_since as the time anchor.
 
         logger.info(
             "Circuit closed",
@@ -556,9 +567,14 @@ class CircuitBreakerManager:
         if not circuit.is_flapping:
             return
 
-        # Clear flapping if circuit has been CLOSED for 10 minutes
-        if circuit.state == CircuitStatus.CLOSED and circuit.last_success_time:
-            time_stable = (datetime.now(timezone.utc) - circuit.last_success_time).total_seconds()
+        # Clear flapping if circuit has been CLOSED and stable for 10 minutes
+        if circuit.state == CircuitStatus.CLOSED:
+            if circuit.stable_since is None:
+                # Backfill for pre-existing circuits: start timing from now
+                circuit.stable_since = datetime.now(timezone.utc)
+                return
+
+            time_stable = (datetime.now(timezone.utc) - circuit.stable_since).total_seconds()
 
             if time_stable > 600:  # 10 minutes
                 circuit.is_flapping = False
@@ -697,6 +713,7 @@ class CircuitBreakerManager:
             circuit.backoff_level = 0
             circuit.is_flapping = False
             circuit.priority_penalty = 0
+            circuit.stable_since = datetime.now(timezone.utc)
             circuit.test_probe_in_progress = False
             circuit.test_probe_started_at = None
 

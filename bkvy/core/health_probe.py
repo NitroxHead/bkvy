@@ -431,6 +431,13 @@ class BackgroundProbeWorker:
                 count=stuck_circuits_cleared
             )
 
+        # Check CLOSED+flapping circuits for flapping clearance
+        for circuit in self.circuit_breaker.circuits.values():
+            if circuit.is_flapping and circuit.state == CircuitStatus.CLOSED:
+                await self.circuit_breaker._check_flapping_clear(circuit)
+                # Persist changes (stable_since backfill or flapping cleared)
+                await self.circuit_breaker.persistence.save_state(circuit)
+
         # Find circuits ready to test
         circuits_to_probe = []
 
