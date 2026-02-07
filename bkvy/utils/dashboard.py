@@ -302,24 +302,25 @@ class DashboardDataProcessor:
                             pass
 
                     # Recent transactions (keep last 100)
-                    if len(recent_transactions) < 100:
-                        recent_transactions.append({
-                            "timestamp": row['timestamp'],
-                            "request_id": row['request_id'],
-                            "client_id": row.get('client_id', ''),
-                            "routing_method": row.get('routing_method', ''),
-                            "intelligence_level": row.get('intelligence_level', ''),
-                            "max_wait_seconds": row.get('max_wait_seconds', ''),
-                            "success": is_success,
-                            "provider": row.get('provider_used', ''),
-                            "model": row.get('model_used', ''),
-                            "api_key": row.get('api_key_used', ''),
-                            "total_time_ms": row.get('total_time_ms', ''),
-                            "cost": f"{cost:.6f}" if cost > 0 else '',
-                            "error_type": row.get('error_type', ''),
-                            "input_tokens": row.get('input_tokens', ''),
-                            "output_tokens": row.get('output_tokens', '')
-                        })
+                    recent_transactions.append({
+                        "timestamp": row['timestamp'],
+                        "request_id": row['request_id'],
+                        "client_id": row.get('client_id', ''),
+                        "routing_method": row.get('routing_method', ''),
+                        "intelligence_level": row.get('intelligence_level', ''),
+                        "max_wait_seconds": row.get('max_wait_seconds', ''),
+                        "success": is_success,
+                        "provider": row.get('provider_used', ''),
+                        "model": row.get('model_used', ''),
+                        "api_key": row.get('api_key_used', ''),
+                        "total_time_ms": row.get('total_time_ms', ''),
+                        "cost": f"{cost:.6f}" if cost > 0 else '',
+                        "error_type": row.get('error_type', ''),
+                        "input_tokens": row.get('input_tokens', ''),
+                        "output_tokens": row.get('output_tokens', '')
+                    })
+                    if len(recent_transactions) > 100:
+                        recent_transactions.pop(0)
 
             # Format time series data
             sorted_time_series = []
