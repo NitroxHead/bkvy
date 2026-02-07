@@ -18,6 +18,7 @@ from ..models.schemas import (
 from ..utils.logging import setup_logging
 from ..utils.transaction_logger import get_transaction_logger, TransactionRecord
 from ..utils.summary_stats import get_summary_stats_logger
+from ..core.pending_tracker import get_pending_tracker
 
 logger = setup_logging()
 
@@ -134,6 +135,20 @@ class IntelligentRouter:
         start_time = time.time()
         request_id = str(uuid.uuid4())
 
+        # Track pending request
+        tracker = get_pending_tracker()
+        if tracker:
+            await tracker.add(request_id, request.client_id, "intelligence",
+                              request.intelligence_level.value, request.max_wait_seconds)
+
+        try:
+            return await self._route_intelligence_inner(request, request_id, start_time)
+        finally:
+            if tracker:
+                await tracker.remove(request_id)
+
+    async def _route_intelligence_inner(self, request: IntelligenceRequest, request_id: str, start_time: float) -> LLMResponse:
+        """Inner logic for route_intelligence_request"""
         # Create transaction record
         transaction_logger = get_transaction_logger()
         transaction_record = None
@@ -145,7 +160,7 @@ class IntelligentRouter:
             )
             transaction_record.intelligence_level = request.intelligence_level.value
             transaction_record.max_wait_seconds = request.max_wait_seconds
-        
+
         # Get all models matching intelligence level
         model_combinations = self.config.get_models_by_intelligence(request.intelligence_level.value)
         
@@ -225,10 +240,10 @@ class IntelligentRouter:
         # Try each alternative with retry logic - WITH EXCEPTION SAFETY
         try:
             result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-                sorted_analyses, request.messages, request.options, start_time
+                sorted_analyses, request.messages, request.options, start_time, request_id
             )
         except Exception as e:
-            logger.error("💥 FATAL ERROR in retry logic", 
+            logger.error("💥 FATAL ERROR in retry logic",
                         error=str(e),
                         traceback=traceback.format_exc())
             full_response = LLMResponse(
@@ -290,6 +305,20 @@ class IntelligentRouter:
         start_time = time.time()
         request_id = str(uuid.uuid4())
 
+        # Track pending request
+        tracker = get_pending_tracker()
+        if tracker:
+            await tracker.add(request_id, request.client_id, "scenario",
+                              request.scenario, request.max_wait_seconds)
+
+        try:
+            return await self._route_scenario_inner(request, request_id, start_time)
+        finally:
+            if tracker:
+                await tracker.remove(request_id)
+
+    async def _route_scenario_inner(self, request: ScenarioRequest, request_id: str, start_time: float) -> LLMResponse:
+        """Inner logic for route_scenario_request"""
         # Create transaction record
         transaction_logger = get_transaction_logger()
         transaction_record = None
@@ -301,7 +330,7 @@ class IntelligentRouter:
             )
             transaction_record.scenario = request.scenario
             transaction_record.max_wait_seconds = request.max_wait_seconds
-        
+
         # Get scenario combinations
         scenario_combinations = self.config.get_scenario_combinations(request.scenario)
         
@@ -368,11 +397,11 @@ class IntelligentRouter:
 
         # Try each alternative with retry logic
         result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-            sorted_analyses, request.messages, request.options, start_time
+            sorted_analyses, request.messages, request.options, start_time, request_id
         )
-        
+
         total_time = time.time() - start_time
-        
+
         if result["success"]:
             full_response = LLMResponse(
                 success=True,
@@ -419,6 +448,20 @@ class IntelligentRouter:
         start_time = time.time()
         request_id = str(uuid.uuid4())
 
+        # Track pending request
+        tracker = get_pending_tracker()
+        if tracker:
+            await tracker.add(request_id, request.client_id, "direct",
+                              f"{request.provider}/{request.model_name}", request.max_wait_seconds)
+
+        try:
+            return await self._route_direct_inner(request, request_id, start_time)
+        finally:
+            if tracker:
+                await tracker.remove(request_id)
+
+    async def _route_direct_inner(self, request: DirectRequest, request_id: str, start_time: float) -> LLMResponse:
+        """Inner logic for route_direct_request"""
         # Create transaction record
         transaction_logger = get_transaction_logger()
         transaction_record = None
@@ -431,7 +474,7 @@ class IntelligentRouter:
             transaction_record.requested_provider = request.provider
             transaction_record.requested_model = request.model_name
             transaction_record.max_wait_seconds = request.max_wait_seconds
-        
+
         # Validate provider and model
         if request.provider not in self.config.providers:
             full_response = LLMResponse(
@@ -534,11 +577,11 @@ class IntelligentRouter:
 
         # Try each alternative with retry logic
         result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-            sorted_analyses, request.messages, request.options, start_time
+            sorted_analyses, request.messages, request.options, start_time, request_id
         )
-        
+
         total_time = time.time() - start_time
-        
+
         if result["success"]:
             full_response = LLMResponse(
                 success=True,
@@ -576,7 +619,7 @@ class IntelligentRouter:
     
     async def _execute_with_retry_and_fallback(self, sorted_analyses: List[CompletionTimeAnalysis],
                                              messages: List[Message], options: Optional[LLMOptions],
-                                             start_time: float = None) -> Tuple[Dict[str, Any], CompletionTimeAnalysis, Dict[str, Any]]:
+                                             start_time: float = None, request_id: str = None) -> Tuple[Dict[str, Any], CompletionTimeAnalysis, Dict[str, Any]]:
         """Execute request with retry logic and automatic failover - enhanced error handling with 429 provider awareness"""
         MAX_RETRIES = 3
         attempt_info = {
@@ -648,6 +691,12 @@ class IntelligentRouter:
                            model=analysis.model)
                 
                 try:
+                    # Update pending tracker with current attempt
+                    if request_id:
+                        tracker = get_pending_tracker()
+                        if tracker:
+                            await tracker.update(request_id, analysis.provider, analysis.model, analysis.api_key_id)
+
                     result = await self._execute_request(analysis, messages, options)
 
                     if result["success"]:

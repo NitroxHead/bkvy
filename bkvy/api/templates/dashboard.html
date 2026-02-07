@@ -407,6 +407,58 @@
             }
         }
 
+        .pending-count {
+            display: inline-block;
+            min-width: 24px;
+            height: 24px;
+            line-height: 24px;
+            padding: 0 8px;
+            margin-left: 8px;
+            background: var(--accent-cyan);
+            color: var(--base-white);
+            font-size: 12px;
+            font-weight: 600;
+            text-align: center;
+            border-radius: 12px;
+            vertical-align: middle;
+        }
+
+        .pending-count.active {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .pending-count.zero {
+            background: var(--neutral-gray-50);
+            animation: none;
+        }
+
+        .row-overdue {
+            background: rgba(220, 32, 38, 0.1) !important;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .row-overdue {
+                background: rgba(220, 32, 38, 0.2) !important;
+            }
+        }
+
+        .overdue-text {
+            color: var(--error-red);
+            font-weight: 600;
+        }
+
+        .pending-empty {
+            padding: 32px;
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
         @media (max-width: 672px) {
             .stats-grid {
                 grid-template-columns: 1fr;
@@ -621,6 +673,30 @@
                             </tbody>
                         </table>
                     </div>
+                </div>
+
+                <!-- Active Requests Table -->
+                <div class="table-card" id="pendingSection">
+                    <h2>Active Requests <span class="pending-count zero" id="pendingCount">0</span></h2>
+                    <div class="table-wrapper">
+                        <table id="pendingTable">
+                            <thead>
+                                <tr>
+                                    <th>Request ID</th>
+                                    <th>Client</th>
+                                    <th>Method</th>
+                                    <th>Target</th>
+                                    <th>Provider</th>
+                                    <th>Model</th>
+                                    <th>Elapsed</th>
+                                    <th>Max Wait</th>
+                                </tr>
+                            </thead>
+                            <tbody id="pendingBody">
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="pending-empty" id="pendingEmpty">No active requests</div>
                 </div>
 
                 <!-- Recent Transactions Table -->
@@ -1250,9 +1326,69 @@
             loadDashboardData(hours);
         }
 
+        let pendingTimer = null;
+
+        async function loadPendingRequests() {
+            try {
+                const response = await fetch('/dashboard/pending');
+                if (!response.ok) return;
+                const data = await response.json();
+                updatePendingTable(data.pending_requests || []);
+            } catch (e) {
+                // Silently ignore - pending data is best-effort
+            }
+        }
+
+        function updatePendingTable(requests) {
+            const tbody = document.getElementById('pendingBody');
+            const countBadge = document.getElementById('pendingCount');
+            const emptyMsg = document.getElementById('pendingEmpty');
+            const table = document.getElementById('pendingTable');
+
+            countBadge.textContent = requests.length;
+
+            if (requests.length === 0) {
+                countBadge.className = 'pending-count zero';
+                table.style.display = 'none';
+                emptyMsg.style.display = 'block';
+                return;
+            }
+
+            countBadge.className = 'pending-count active';
+            table.style.display = 'table';
+            emptyMsg.style.display = 'none';
+
+            tbody.innerHTML = '';
+
+            requests.forEach(req => {
+                const row = tbody.insertRow();
+                const overdue = req.max_wait_seconds > 0 && req.elapsed_seconds > req.max_wait_seconds;
+
+                if (overdue) {
+                    row.className = 'row-overdue';
+                }
+
+                const methodBadge = getBadgeClass(req.routing_method);
+                const elapsedClass = overdue ? 'overdue-text' : '';
+
+                row.innerHTML = `
+                    <td>${req.request_id.substring(0, 8)}...</td>
+                    <td>${req.client_id || '-'}</td>
+                    <td><span class="badge ${methodBadge}">${req.routing_method}</span></td>
+                    <td>${req.target || '-'}</td>
+                    <td>${req.provider || '-'}</td>
+                    <td>${req.model || '-'}</td>
+                    <td class="${elapsedClass}">${req.elapsed_seconds}s</td>
+                    <td>${req.max_wait_seconds}s</td>
+                `;
+            });
+        }
+
         window.addEventListener('load', () => {
             loadDashboardData(24);
             changeRefreshInterval();
+            loadPendingRequests();
+            pendingTimer = setInterval(loadPendingRequests, 2000);
         });
     </script>
 </body>

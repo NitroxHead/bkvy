@@ -16,6 +16,7 @@ from ..utils.logging import setup_logging
 from ..utils.transaction_logger import init_transaction_logger
 from ..utils.summary_stats import init_summary_stats_logger
 from ..utils.dashboard import init_dashboard_processor
+from ..core.pending_tracker import init_pending_tracker, get_pending_tracker
 
 logger = setup_logging()
 
@@ -29,13 +30,14 @@ dashboard_processor = None
 circuit_breaker = None
 health_probe = None
 probe_worker = None
+pending_tracker = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown"""
     global config_manager, rate_limit_manager, queue_manager, llm_client, router, dashboard_processor
-    global circuit_breaker, health_probe, probe_worker
+    global circuit_breaker, health_probe, probe_worker, pending_tracker
 
     # Startup
     logger.info("Starting bkvy application")
@@ -103,6 +105,10 @@ async def lifespan(app: FastAPI):
         logger.info("Health probe worker initialized",
                    enabled=probe_worker.enabled,
                    interval_seconds=probe_worker.interval_seconds)
+
+        # Initialize pending request tracker
+        pending_tracker = init_pending_tracker()
+        logger.info("Pending request tracker initialized")
 
         # Initialize router with all dependencies
         router = IntelligentRouter(
