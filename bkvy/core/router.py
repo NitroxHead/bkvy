@@ -697,7 +697,15 @@ class IntelligentRouter:
                         if tracker:
                             await tracker.update(request_id, analysis.provider, analysis.model, analysis.api_key_id)
 
-                    result = await self._execute_request(analysis, messages, options)
+                    # Calculate per-attempt timeout from global remaining time
+                    per_attempt_timeout = self.timeout_manager.get_request_timeout(start_time, escalated)
+                    if per_attempt_timeout <= 0:
+                        raise asyncio.TimeoutError("No time remaining")
+
+                    result = await asyncio.wait_for(
+                        self._execute_request(analysis, messages, options),
+                        timeout=per_attempt_timeout
+                    )
 
                     if result["success"]:
                         logger.info("SUCCESS",
@@ -804,6 +812,37 @@ class IntelligentRouter:
                                            next_retry=retry_attempt + 1)
                                 await asyncio.sleep(wait_time)
                             
+                except asyncio.TimeoutError:
+                    # Per-attempt timeout - skip to next alternative immediately
+                    elapsed = time.time() - start_time
+                    error_msg = f"Per-attempt timeout ({elapsed:.1f}s elapsed)"
+
+                    logger.warning("Attempt timed out, moving to next alternative",
+                                 alternative=attempt_info["alternatives_tried"],
+                                 retry=retry_attempt,
+                                 provider=analysis.provider,
+                                 model=analysis.model,
+                                 elapsed_seconds=elapsed)
+
+                    # Record timeout with circuit breaker
+                    if self.circuit_breaker and self.circuit_breaker.enabled:
+                        await self.circuit_breaker.record_failure(
+                            analysis.provider, analysis.model, analysis.api_key_id,
+                            error_msg, status_code=None, response_time_ms=None,
+                            response_headers=None
+                        )
+
+                    attempt_info["failures"].append({
+                        "alternative": attempt_info["alternatives_tried"],
+                        "retry": retry_attempt,
+                        "provider": analysis.provider,
+                        "model": analysis.model,
+                        "api_key_id": analysis.api_key_id,
+                        "error": error_msg,
+                        "strategy": "skip_alternative"
+                    })
+                    break  # Skip to next alternative - don't retry a hung provider
+
                 except Exception as e:
                     # Unexpected error (not from API response)
                     error_msg = f"Unexpected error: {str(e)}"
