@@ -161,139 +161,126 @@ class IntelligentRouter:
             transaction_record.intelligence_level = request.intelligence_level.value
             transaction_record.max_wait_seconds = request.max_wait_seconds
 
-        # Get all models matching intelligence level
-        model_combinations = self.config.get_models_by_intelligence(request.intelligence_level.value)
-        
-        logger.info("🔍 INTELLIGENCE DEBUG: Found models for intelligence level", 
-                   intelligence_level=request.intelligence_level.value,
-                   combinations=model_combinations,
-                   count=len(model_combinations))
-        
-        if not model_combinations:
-            full_response = LLMResponse(
-                success=False,
-                request_id=request_id,
-                error_code="no_models_available",
-                message=f"No models available for intelligence level: {request.intelligence_level.value}"
-            )
+        # Build tier escalation order: requested tier first, then others by cost
+        tier_order = {"low": ["low", "medium", "high"], "medium": ["medium", "low", "high"], "high": ["high", "medium", "low"]}
+        tiers_to_try = tier_order.get(request.intelligence_level.value, [request.intelligence_level.value])
 
-            # Log transaction failure
-            await self._log_failed_transaction(transaction_record, "no_models_available", full_response.message, time.time() - start_time)
+        all_blocked_analyses = []
+        last_error = None
+        total_attempts_across_tiers = 0
 
-            if not request.debug:
-                return self._create_simplified_response(full_response)
-            return full_response
-        
-        # Analyze all combinations (use max_wait_seconds for route calculation only)
-        logger.info("🔍 ANALYSIS DEBUG: Starting analysis of all combinations")
-        analyses = await self._analyze_all_combinations(model_combinations, request.max_wait_seconds)
+        for tier in tiers_to_try:
+            model_combinations = self.config.get_models_by_intelligence(tier)
 
-        logger.info("🔍 ANALYSIS DEBUG: Analysis complete",
-                   valid_analyses=len(analyses),
-                   total_combinations=len(model_combinations))
+            if not model_combinations:
+                continue
 
-        if not analyses:
-            return await self._create_failure_response(model_combinations, request.max_wait_seconds, "intelligence", request_id)
+            logger.info("Intelligence routing: trying tier",
+                       requested_tier=request.intelligence_level.value,
+                       trying_tier=tier,
+                       combinations=model_combinations,
+                       count=len(model_combinations))
 
-        # Filter through circuit breaker
-        if self.circuit_breaker and self.circuit_breaker.enabled:
-            usable_analyses, blocked_analyses = await self.circuit_breaker.filter_alternatives(analyses)
+            analyses = await self._analyze_all_combinations(model_combinations, request.max_wait_seconds)
 
-            logger.info("🔌 CIRCUIT BREAKER: Filtered alternatives",
-                       total=len(analyses),
-                       usable=len(usable_analyses),
-                       blocked=len(blocked_analyses))
+            if not analyses:
+                continue
 
-            if not usable_analyses:
-                full_response = LLMResponse(
-                    success=False,
-                    request_id=request_id,
-                    error_code="all_circuits_blocked",
-                    message=f"All {len(analyses)} alternatives are circuit-blocked",
-                    evaluated_combinations=blocked_analyses
+            # Filter through circuit breaker
+            if self.circuit_breaker and self.circuit_breaker.enabled:
+                usable_analyses, blocked_analyses = await self.circuit_breaker.filter_alternatives(analyses)
+                all_blocked_analyses.extend(blocked_analyses)
+
+                logger.info("Circuit breaker filtered",
+                           tier=tier,
+                           total=len(analyses),
+                           usable=len(usable_analyses),
+                           blocked=len(blocked_analyses))
+
+                if not usable_analyses:
+                    continue
+
+                sorted_analyses = usable_analyses
+            else:
+                sorted_analyses = sorted(analyses, key=lambda x: (x.cost_per_1k_tokens, x.total_seconds))
+
+            if tier != request.intelligence_level.value:
+                logger.warning("Tier escalation: using fallback tier",
+                              requested=request.intelligence_level.value,
+                              using=tier)
+
+            # Try executing with this tier's alternatives
+            try:
+                result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
+                    sorted_analyses, request.messages, request.options, start_time, request_id
                 )
-                await self._log_failed_transaction(transaction_record, "all_circuits_blocked", full_response.message, time.time() - start_time)
+            except Exception as e:
+                logger.error("Error in retry logic for tier, escalating",
+                            tier=tier,
+                            error=str(e),
+                            traceback=traceback.format_exc())
+                last_error = str(e)
+                continue
 
+            total_time = time.time() - start_time
+            total_attempts_across_tiers += attempt_info.get('total_attempts', 0)
+
+            if result["success"]:
+                attempt_info['total_attempts'] = total_attempts_across_tiers
+                full_response = LLMResponse(
+                    success=True,
+                    request_id=request_id,
+                    provider_used=used_analysis.provider,
+                    model_used=used_analysis.model,
+                    api_key_used=used_analysis.api_key_id,
+                    routing_method=RoutingMethod.INTELLIGENCE,
+                    decision_reason=f"cheapest_within_estimate_after_{total_attempts_across_tiers}_attempts",
+                    response=result["response"],
+                    metadata=self._create_metadata_with_attempts(used_analysis, sorted_analyses, total_time, attempt_info)
+                )
+                await self._log_successful_transaction(transaction_record, full_response, used_analysis, result, attempt_info, total_time)
                 if not request.debug:
                     return self._create_simplified_response(full_response)
                 return full_response
+            else:
+                # This tier's alternatives all failed at runtime — try next tier
+                last_error = result.get('error', 'Unknown error')
+                logger.warning("All alternatives failed for tier, escalating",
+                              tier=tier,
+                              error=last_error)
+                continue
 
-            sorted_analyses = usable_analyses  # Already sorted by circuit breaker
-        else:
-            # Sort by best combination (cheapest, then fastest) if no circuit breaker
-            sorted_analyses = sorted(analyses, key=lambda x: (x.cost_per_1k_tokens, x.total_seconds))
-        
-        logger.info("🔍 SORTED DEBUG: All alternatives in order", 
-                   alternatives_count=len(sorted_analyses),
-                   alternatives=[{
-                       "rank": i+1,
-                       "provider": analysis.provider,
-                       "model": analysis.model,
-                       "api_key_id": analysis.api_key_id,
-                       "cost": analysis.cost_per_1k_tokens,
-                       "total_seconds": analysis.total_seconds
-                   } for i, analysis in enumerate(sorted_analyses)])
-        
-        logger.info("🚀 RETRY DEBUG: Attempting request with retry logic", 
-                   alternatives_count=len(sorted_analyses))
-        
-        # Try each alternative with retry logic - WITH EXCEPTION SAFETY
-        try:
-            result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-                sorted_analyses, request.messages, request.options, start_time, request_id
-            )
-        except Exception as e:
-            logger.error("💥 FATAL ERROR in retry logic",
-                        error=str(e),
-                        traceback=traceback.format_exc())
+        # All tiers exhausted — log failure
+        total_time = time.time() - start_time
+        if all_blocked_analyses and not last_error:
             full_response = LLMResponse(
                 success=False,
                 request_id=request_id,
-                error_code="retry_logic_failure",
-                message=f"Fatal error in retry logic: {str(e)}"
+                error_code="all_circuits_blocked",
+                message=f"All alternatives across all tiers are circuit-blocked",
+                evaluated_combinations=all_blocked_analyses
             )
-            if not request.debug:
-                return self._create_simplified_response(full_response)
-            return full_response
-        
-        total_time = time.time() - start_time
-        
-        if result["success"]:
-            full_response = LLMResponse(
-                success=True,
-                request_id=request_id,
-                provider_used=used_analysis.provider,
-                model_used=used_analysis.model,
-                api_key_used=used_analysis.api_key_id,
-                routing_method=RoutingMethod.INTELLIGENCE,
-                decision_reason=f"cheapest_within_estimate_after_{attempt_info['total_attempts']}_attempts",
-                response=result["response"],
-                metadata=self._create_metadata_with_attempts(used_analysis, sorted_analyses, total_time, attempt_info)
-            )
-
-            # Log successful transaction
-            await self._log_successful_transaction(transaction_record, full_response, used_analysis, result, attempt_info, total_time)
-
-            # Return simplified response if debug is False
-            if not request.debug:
-                return self._create_simplified_response(full_response)
-            return full_response
-        else:
+            await self._log_failed_transaction(transaction_record, "all_circuits_blocked", full_response.message, total_time)
+        elif last_error:
             full_response = LLMResponse(
                 success=False,
                 request_id=request_id,
                 error_code="all_alternatives_failed",
-                message=f"All {len(sorted_analyses)} alternatives failed after retry attempts. Last error: {result.get('error', 'Unknown error')}",
-                evaluated_combinations=self._create_failure_summary(sorted_analyses, attempt_info)
+                message=f"All alternatives across all tiers failed. Last error: {last_error}",
             )
+            await self._log_failed_transaction(transaction_record, "all_alternatives_failed", full_response.message, total_time)
+        else:
+            full_response = LLMResponse(
+                success=False,
+                request_id=request_id,
+                error_code="no_models_available",
+                message=f"No models available for any intelligence level"
+            )
+            await self._log_failed_transaction(transaction_record, "no_models_available", full_response.message, total_time)
 
-            # Log failed transaction
-            await self._log_failed_transaction(transaction_record, "all_alternatives_failed", full_response.message, total_time, attempt_info)
-
-            # Return simplified response if debug is False
-            if not request.debug:
-                return self._create_simplified_response(full_response)
-            return full_response
+        if not request.debug:
+            return self._create_simplified_response(full_response)
+        return full_response
     
     async def route_scenario_request(self, request: ScenarioRequest) -> LLMResponse:
         """Route request based on scenario - WAITS FOR COMPLETION WITH RETRY LOGIC"""
