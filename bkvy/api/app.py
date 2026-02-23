@@ -26,6 +26,9 @@ from ..utils.summary_stats import get_summary_stats_logger
 from ..utils.dashboard import get_dashboard_processor
 from ..core.pending_tracker import get_pending_tracker
 
+# Agent system routes
+from .agent_routes import router as agent_router, tools_router, mcp_router
+
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application"""
@@ -507,5 +510,14 @@ def create_app() -> FastAPI:
         if not tracker:
             return {"pending_requests": []}
         return {"pending_requests": await tracker.get_all()}
+
+    # =============================================================================
+    # AGENT SYSTEM ROUTES
+    # =============================================================================
+
+    # Include agent system routers
+    app.include_router(agent_router)
+    app.include_router(tools_router)
+    app.include_router(mcp_router)
 
     return app
