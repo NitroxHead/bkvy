@@ -24,6 +24,7 @@ from .middleware import IPWhitelistMiddleware, parse_ip_list
 from ..utils.transaction_logger import get_transaction_logger
 from ..utils.summary_stats import get_summary_stats_logger
 from ..utils.dashboard import get_dashboard_processor
+from ..core.pending_tracker import get_pending_tracker
 
 
 def create_app() -> FastAPI:
@@ -51,10 +52,22 @@ def create_app() -> FastAPI:
     if dashboard_enabled:
         dashboard_ips = os.getenv("DASHBOARD_ALLOWED_IPS", "127.0.0.1")
         allowed_ips = parse_ip_list(dashboard_ips)
+        # Always allow localhost
+        for lo in ["127.0.0.1", "::1"]:
+            if lo not in allowed_ips:
+                allowed_ips.append(lo)
         app.add_middleware(
             IPWhitelistMiddleware,
             allowed_ips=allowed_ips,
-            protected_paths=["/dashboard"]
+            protected_paths=[
+                "/dashboard",
+                "/statistics",
+                "/debug",
+                "/circuits",
+                "/rates",
+                "/queue",
+                "/providers",
+            ]
         )
 
     # =============================================================================
@@ -486,5 +499,13 @@ def create_app() -> FastAPI:
         health = await dashboard_processor.get_system_health()
         health["enabled"] = True
         return health
+
+    @app.get("/dashboard/pending")
+    async def get_pending_requests():
+        """Get currently in-flight requests (IP-restricted)"""
+        tracker = get_pending_tracker()
+        if not tracker:
+            return {"pending_requests": []}
+        return {"pending_requests": await tracker.get_all()}
 
     return app

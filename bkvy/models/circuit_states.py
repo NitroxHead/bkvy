@@ -94,6 +94,7 @@ class CircuitState:
     # Flapping detection
     is_flapping: bool = False
     flapping_detected_at: Optional[datetime] = None
+    stable_since: Optional[datetime] = None  # When circuit last became CLOSED (for flapping clear)
     priority_penalty: int = 0               # Penalty for prioritization (0 = normal)
     state_changes: List[StateChangeEvent] = field(default_factory=list)
 
@@ -273,7 +274,8 @@ class CircuitState:
         """Create from dictionary"""
         # Convert ISO format strings back to datetime
         for key in ['last_failure_time', 'last_success_time', 'next_test_time',
-                   'flapping_detected_at', 'created_at', 'updated_at', 'test_probe_started_at']:
+                   'flapping_detected_at', 'stable_since', 'created_at', 'updated_at',
+                   'test_probe_started_at']:
             if key in data and data[key]:
                 data[key] = datetime.fromisoformat(data[key])
 
