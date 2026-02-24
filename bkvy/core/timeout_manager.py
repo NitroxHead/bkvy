@@ -69,25 +69,20 @@ class GlobalTimeoutManager:
 
     def get_request_timeout(self, start_time: float, escalated: bool, default_timeout: int = 300) -> int:
         """
-        Calculate per-request timeout based on global timeout state
+        Calculate per-attempt timeout — capped so one slow provider can't starve fallbacks.
 
         Args:
             start_time: Request start timestamp
             escalated: Whether request is in escalated mode
-            default_timeout: Default timeout for non-escalated requests
+            default_timeout: Max seconds for a single attempt (non-escalated)
 
         Returns:
-            Timeout in seconds for this specific request
+            Timeout in seconds for this specific attempt
         """
-        remaining = self.get_remaining_time(start_time)
-
         if escalated:
-            # Use shorter timeout after escalation
-            escalated_timeout = 30
-            return int(min(escalated_timeout, remaining))
+            return 100
         else:
-            # Use default timeout if enough time remains
-            return int(min(default_timeout, remaining))
+            return default_timeout
 
     def reorder_for_escalation(
         self,
@@ -173,7 +168,7 @@ class GlobalTimeoutManager:
         if escalated:
             return {
                 "max_retries": 1,              # Reduce retries
-                "api_timeout": 30,             # Shorter API timeout
+                "api_timeout": 100,            # Fast per-attempt timeout
                 "use_half_open": False,        # Skip HALF_OPEN circuits
                 "optimize_for": "speed",       # Optimize for speed
                 "provider_diversity": True     # Try different providers
@@ -181,7 +176,7 @@ class GlobalTimeoutManager:
         else:
             return {
                 "max_retries": 3,              # Normal retries
-                "api_timeout": 300,            # Normal API timeout
+                "api_timeout": 300,            # Per-attempt timeout cap
                 "use_half_open": True,         # Use all available circuits
                 "optimize_for": "cost",        # Optimize for cost
                 "provider_diversity": False    # Follow normal priority
