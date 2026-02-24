@@ -49,6 +49,9 @@ class CircuitBreakerManager:
         self.sliding_window_seconds = int(os.getenv("CIRCUIT_SLIDING_WINDOW_SECONDS", "600"))  # 10 minutes
         self.sliding_window_threshold = int(os.getenv("CIRCUIT_SLIDING_WINDOW_THRESHOLD", "5"))  # 5 failures
 
+        # Wait-slot reservations: tracks how many requests are waiting for each circuit to reopen
+        self._wait_reservations: Dict[str, int] = {}
+
         logger.info(
             "Circuit breaker manager initialized",
             enabled=self.enabled,
@@ -515,6 +518,7 @@ class CircuitBreakerManager:
                     'api_key_id': analysis.api_key_id,
                     'reason': reason,
                     'wait_time_seconds': wait_time,
+                    'cost_per_1k_tokens': analysis.cost_per_1k_tokens,
                     'circuit_state': self.circuits.get(
                         f"{analysis.provider}_{analysis.model}_{analysis.api_key_id}"
                     ).state.value if f"{analysis.provider}_{analysis.model}_{analysis.api_key_id}" in self.circuits else 'unknown'
@@ -540,6 +544,23 @@ class CircuitBreakerManager:
         )
 
         return (usable, blocked)
+
+    def reserve_wait_slot(self, provider: str, model: str, api_key_id: str, capacity: int) -> bool:
+        """Reserve a wait slot for a circuit that will reopen soon.
+        Returns True if a slot was reserved, False if at capacity."""
+        key = f"{provider}_{model}_{api_key_id}"
+        current = self._wait_reservations.get(key, 0)
+        if current < capacity:
+            self._wait_reservations[key] = current + 1
+            return True
+        return False
+
+    def release_wait_slot(self, provider: str, model: str, api_key_id: str):
+        """Release a previously reserved wait slot."""
+        key = f"{provider}_{model}_{api_key_id}"
+        current = self._wait_reservations.get(key, 0)
+        if current > 0:
+            self._wait_reservations[key] = current - 1
 
     async def _check_flapping(self, circuit: CircuitState):
         """Check if circuit is flapping and apply penalty"""

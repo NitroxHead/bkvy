@@ -2,11 +2,18 @@
 Logging configuration for bkvy
 """
 
+import logging
+import os
+
 import structlog
 
 
 def setup_logging():
     """Configure structured logging for the application"""
+    # Set root logger level from LOG_LEVEL env var so filter_by_level works
+    log_level = os.getenv("LOG_LEVEL", "info").upper()
+    logging.basicConfig(format="%(message)s", level=getattr(logging, log_level, logging.INFO))
+
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
@@ -24,5 +31,5 @@ def setup_logging():
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
-    
+
     return structlog.get_logger()
