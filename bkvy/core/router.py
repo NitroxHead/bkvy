@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 from ..models.enums import RoutingMethod
 from ..models.data_classes import CompletionTimeAnalysis
+from ..models.circuit_states import CircuitStatus
 from ..models.schemas import (
     IntelligenceRequest, ScenarioRequest, DirectRequest, 
     LLMResponse, SimplifiedResponse, ResponseMetadata, Message, LLMOptions
@@ -695,12 +696,27 @@ class IntelligentRouter:
             attempt_info["alternatives_tried"] += 1
             last_tried_provider = analysis.provider
 
+            # For recovery-eligible circuits (not CLOSED), acquire the test lock
+            # right before we actually send a request.  If another request already
+            # holds the lock we skip to the next alternative instead of waiting.
+            if (self.circuit_breaker and self.circuit_breaker.enabled
+                    and hasattr(analysis, 'circuit_state')
+                    and analysis.circuit_state != CircuitStatus.CLOSED):
+                locked = await self.circuit_breaker.acquire_test_lock(
+                    analysis.provider, analysis.model, analysis.api_key_id)
+                if not locked:
+                    logger.info("Skipping alternative — test lock held by another request",
+                               provider=analysis.provider,
+                               model=analysis.model,
+                               api_key_id=analysis.api_key_id)
+                    continue
+
             logger.info("Trying alternative",
                        alternative_num=attempt_info["alternatives_tried"],
                        provider=analysis.provider,
                        model=analysis.model,
                        api_key_id=analysis.api_key_id)
-            
+
             # Try this alternative up to MAX_RETRIES times
             for retry_attempt in range(1, MAX_RETRIES + 1):
                 attempt_info["total_attempts"] += 1

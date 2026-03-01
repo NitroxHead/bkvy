@@ -434,6 +434,7 @@ class BackgroundProbeWorker:
                             circuit.last_failure_type or FailureType.UNKNOWN_ERROR,
                             None
                         )
+                        await self.circuit_breaker.persistence.save_state(circuit)
 
                         stuck_circuits_cleared += 1
 
