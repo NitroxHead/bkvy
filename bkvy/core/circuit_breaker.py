@@ -408,27 +408,16 @@ class CircuitBreakerManager:
                 return (False, 999999, "auth_failure_requires_manual_fix")
 
             if now >= circuit.next_test_time:
-                # Time to test - try to transition to HALF_OPEN
+                # Circuit is ready for recovery testing.
+                # Don't acquire probe lock here — filter_alternatives() calls this
+                # for ALL alternatives, but only one will actually be tried. Locking
+                # here would orphan locks on every circuit that isn't picked.
+                # The lock is acquired in acquire_test_lock() when the circuit is
+                # actually about to be used.
                 if not circuit.test_probe_in_progress:
-                    # Acquire test lock with timestamp
-                    circuit.test_probe_in_progress = True
-                    circuit.test_probe_started_at = datetime.now(timezone.utc)
-                    circuit.record_state_change(
-                        CircuitStatus.HALF_OPEN,
-                        "testing_recovery"
-                    )
-                    await self.persistence.save_state(circuit)
-
-                    logger.info(
-                        "Circuit transitioned to HALF_OPEN for testing",
-                        provider=provider,
-                        model=model,
-                        api_key_id=api_key_id
-                    )
-
                     return (True, 0, "testing_recovery")
                 else:
-                    # Someone else is testing
+                    # Someone else is testing (background probe or another request)
                     return (False, 2, "probe_in_progress")
             else:
                 # Not time yet
@@ -561,6 +550,39 @@ class CircuitBreakerManager:
         current = self._wait_reservations.get(key, 0)
         if current > 0:
             self._wait_reservations[key] = current - 1
+
+    async def acquire_test_lock(self, provider: str, model: str, api_key_id: str) -> bool:
+        """Acquire probe lock just before actually trying a circuit for recovery.
+
+        Called by the router right before sending a request to a HALF_OPEN or
+        recovery-eligible OPEN circuit.  Returns True if the lock was acquired
+        (caller should proceed with the request).  Returns False if someone else
+        already holds the lock (caller should skip to the next alternative).
+        """
+        circuit = self._get_or_create_circuit(provider, model, api_key_id)
+
+        if circuit.test_probe_in_progress:
+            return False
+
+        # Transition OPEN → HALF_OPEN and acquire lock
+        circuit.test_probe_in_progress = True
+        circuit.test_probe_started_at = datetime.now(timezone.utc)
+
+        if circuit.state == CircuitStatus.OPEN:
+            circuit.record_state_change(
+                CircuitStatus.HALF_OPEN,
+                "testing_recovery"
+            )
+
+        await self.persistence.save_state(circuit)
+
+        logger.info(
+            "Acquired test lock for circuit",
+            provider=provider,
+            model=model,
+            api_key_id=api_key_id
+        )
+        return True
 
     async def _check_flapping(self, circuit: CircuitState):
         """Check if circuit is flapping and apply penalty"""
