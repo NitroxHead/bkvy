@@ -29,6 +29,9 @@ from ..core.pending_tracker import get_pending_tracker
 # Agent system routes
 from .agent_routes import router as agent_router, tools_router, mcp_router
 
+# OpenAI-compatible API surface (thin plumbing layer over the intelligence router)
+from .openai_compat import router as openai_router
+
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application"""
@@ -519,5 +522,8 @@ def create_app() -> FastAPI:
     app.include_router(agent_router)
     app.include_router(tools_router)
     app.include_router(mcp_router)
+
+    # Include OpenAI-compatible routes (/v1/chat/completions, /v1/{tier}/chat/completions, /v1/models)
+    app.include_router(openai_router)
 
     return app
