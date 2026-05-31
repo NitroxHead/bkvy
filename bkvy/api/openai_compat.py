@@ -14,7 +14,9 @@ The intelligence tier (low | medium | high) is selected two ways:
   * POST /v1/{tier}/chat/completions  e.g. /v1/low/chat/completions
     (here the JSON "model" field is ignored)
 
-Non-streaming only — stream=true returns a 400.
+Supports streaming (stream=true, SSE) and non-streaming. Streaming preserves
+full pre-first-token fallback and emits an explicit error event on any
+mid-stream break (never a silent truncation).
 """
 
 import os
@@ -57,6 +59,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
+    stream_options: Optional[Dict[str, Any]] = None
     user: Optional[str] = None
 
 
@@ -134,25 +137,11 @@ def _error_response(message: str, status_code: int, err_type: str, code: str) ->
     )
 
 
-async def _handle_chat_completion(tier: str, req: ChatCompletionRequest) -> JSONResponse:
-    """Shared handler: translate -> route -> reshape into OpenAI format."""
-    if req.stream:
-        return _error_response(
-            "Streaming is not supported by this endpoint. Set stream=false.",
-            400, "invalid_request_error", "streaming_not_supported",
-        )
-
-    if not req.messages:
-        return _error_response(
-            "'messages' must contain at least one message.",
-            400, "invalid_request_error", "missing_messages",
-        )
-
+def _build_intelligence_request(tier: str, req: ChatCompletionRequest) -> IntelligenceRequest:
     internal_messages = [
         Message(role=m.role, content=_flatten_content(m.content)) for m in req.messages
     ]
-
-    intelligence_request = IntelligenceRequest(
+    return IntelligenceRequest(
         client_id=req.user or "openai-compat",
         intelligence_level=IntelligenceLevel(tier),
         max_wait_seconds=DEFAULT_MAX_WAIT_SECONDS,
@@ -161,15 +150,33 @@ async def _handle_chat_completion(tier: str, req: ChatCompletionRequest) -> JSON
         debug=False,
     )
 
-    config_manager = get_config_manager()
+
+async def _handle_chat_completion(tier: str, req: ChatCompletionRequest):
+    """Shared handler: translate -> route -> reshape into OpenAI format.
+
+    Returns a JSONResponse for non-streaming requests, or a StreamingResponse
+    (SSE) when req.stream is true.
+    """
+    if not req.messages:
+        return _error_response(
+            "'messages' must contain at least one message.",
+            400, "invalid_request_error", "missing_messages",
+        )
+
     bkvy_router = get_router()
     if bkvy_router is None:
         return _error_response(
             "Router is not initialized.", 503, "server_error", "router_unavailable",
         )
 
+    config_manager = get_config_manager()
     # Keep config hot-reload behavior consistent with the native endpoint.
     await config_manager.refresh_if_changed()
+
+    intelligence_request = _build_intelligence_request(tier, req)
+
+    if req.stream:
+        return _streaming_response(tier, req, intelligence_request, bkvy_router)
 
     result = await bkvy_router.route_intelligence_request(intelligence_request)
 
@@ -214,6 +221,93 @@ async def _handle_chat_completion(tier: str, req: ChatCompletionRequest) -> JSON
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
             },
+        },
+    )
+
+
+def _sse(obj: Dict[str, Any]) -> str:
+    """Encode a dict as a single SSE 'data:' frame."""
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def _streaming_response(tier: str, req: ChatCompletionRequest,
+                        intelligence_request: IntelligenceRequest, bkvy_router) -> StreamingResponse:
+    """Wrap the router's streaming events as OpenAI chat.completion.chunk SSE frames."""
+    include_usage = bool((req.stream_options or {}).get("include_usage"))
+    created = int(time.time())
+
+    async def event_stream():
+        chunk_id = "chatcmpl-stream"
+        model_label = f"bkvy-{tier}"
+        role_sent = False
+        try:
+            async for event in bkvy_router.route_intelligence_request_stream(intelligence_request):
+                etype = event.get("type")
+
+                if etype == "start":
+                    chunk_id = f"chatcmpl-{event.get('request_id', 'stream')}"
+                    model_label = event.get("model") or model_label
+
+                elif etype == "delta":
+                    base = {
+                        "id": chunk_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_label,
+                    }
+                    if not role_sent:
+                        # First chunk carries the assistant role, per OpenAI's format.
+                        role_sent = True
+                        first = dict(base)
+                        first["choices"] = [{"index": 0, "delta": {"role": "assistant"},
+                                             "finish_reason": None}]
+                        yield _sse(first)
+                    frame = dict(base)
+                    frame["choices"] = [{"index": 0, "delta": {"content": event["content"]},
+                                         "finish_reason": None}]
+                    yield _sse(frame)
+
+                elif etype == "done":
+                    finish = _map_finish_reason(event.get("finish_reason"), None)
+                    final = {
+                        "id": chunk_id, "object": "chat.completion.chunk",
+                        "created": created, "model": event.get("model_used") or model_label,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    }
+                    if include_usage:
+                        usage = event.get("usage") or {}
+                        pt = int(usage.get("input_tokens", 0) or 0)
+                        ct = int(usage.get("output_tokens", 0) or 0)
+                        final["usage"] = {
+                            "prompt_tokens": pt, "completion_tokens": ct,
+                            "total_tokens": int(usage.get("total_tokens", pt + ct) or 0),
+                        }
+                    yield _sse(final)
+                    yield "data: [DONE]\n\n"
+                    return
+
+                elif etype == "error":
+                    # Terminal failure. If it happened before any token, this is the
+                    # only thing the client sees; if mid-stream, it follows partial
+                    # content so the caller knows the output is incomplete.
+                    err = {"error": {
+                        "message": event.get("error", "stream failed"),
+                        "type": "upstream_error",
+                        "code": "stream_failed" if role_sent else "all_alternatives_failed",
+                    }}
+                    yield _sse(err)
+                    yield "data: [DONE]\n\n"
+                    return
+        except Exception as e:  # pragma: no cover - defensive
+            yield _sse({"error": {"message": f"Internal streaming error: {e}",
+                                  "type": "server_error", "code": "stream_exception"}})
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # belt-and-suspenders against proxy buffering
         },
     )
 
