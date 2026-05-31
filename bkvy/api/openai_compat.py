@@ -21,10 +21,11 @@ mid-stream break (never a silent truncation).
 
 import os
 import time
+import json
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, BackgroundTasks, Path
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..models.enums import IntelligenceLevel
