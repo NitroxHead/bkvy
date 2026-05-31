@@ -238,11 +238,11 @@ class FailureClassifier:
 
         import re
 
-        # Gemini daily quota exhaustion (free tier RPD) — wait until midnight Pacific
+        # Gemini daily quota exhaustion (free tier RPD) - wait until midnight Pacific
         # Two patterns:
         # 1. "PerDay" in quotaId (e.g. gemini-2.0-flash format)
         # 2. metric "generate_content_free_tier_requests" with limit: 20 (gemini-2.5-flash format)
-        #    — "retry in Xs" in this message is the RPM window reset, NOT the daily reset
+        #    - "retry in Xs" in this message is the RPM window reset, NOT the daily reset
         error_lower_no_sep = error_lower.replace('_', '').replace('-', '')
         is_daily_quota = (
             ('perday' in error_lower_no_sep and 'free_tier' in error_lower)

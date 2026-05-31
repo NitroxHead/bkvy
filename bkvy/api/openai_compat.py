@@ -2,7 +2,7 @@
 OpenAI-compatible API surface for bkvy.
 
 A thin plumbing/translation layer on top of the existing intelligence router.
-It does NOT change any core routing logic — it only:
+It does NOT change any core routing logic - it only:
   1. accepts the OpenAI Chat Completions request shape,
   2. maps it onto an internal IntelligenceRequest,
   3. calls the existing router.route_intelligence_request(),
@@ -42,7 +42,7 @@ VALID_TIERS = {"low", "medium", "high"}
 
 
 # ---------------------------------------------------------------------------
-# Request models (lenient — we accept and ignore extra OpenAI fields)
+# Request models (lenient - we accept and ignore extra OpenAI fields)
 # ---------------------------------------------------------------------------
 class OpenAIMessage(BaseModel):
     model_config = ConfigDict(protected_namespaces=(), extra="allow")

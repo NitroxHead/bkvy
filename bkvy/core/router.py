@@ -172,7 +172,7 @@ class IntelligentRouter:
 
         Resilience contract ("no request lost"):
           * Failures BEFORE the first token fall back across every alternative
-            and every tier — identical to the synchronous path.
+            and every tier - identical to the synchronous path.
           * Once the first token is forwarded the request is committed; a
             mid-stream break ends with an explicit "error" event (never a
             silent truncation), so the caller can retry safely.
@@ -369,7 +369,7 @@ class IntelligentRouter:
                         error_msg, status_code=None, response_time_ms=None, response_headers=None)
 
                 if first_token_seen:
-                    # Committed — cannot fall back without splicing models. Terminal.
+                    # Committed - cannot fall back without splicing models. Terminal.
                     logger.error("Stream broke after first token; emitting error event",
                                 provider=analysis.provider, model=analysis.model, error=error_msg)
                     yield {"type": "error",
@@ -533,14 +533,14 @@ class IntelligentRouter:
                     return self._create_simplified_response(full_response)
                 return full_response
             else:
-                # This tier's alternatives all failed at runtime — try next tier
+                # This tier's alternatives all failed at runtime - try next tier
                 last_error = result.get('error', 'Unknown error')
                 logger.warning("All alternatives failed for tier, escalating",
                               tier=tier,
                               error=last_error)
                 continue
 
-        # All tiers exhausted — log failure
+        # All tiers exhausted - log failure
         total_time = time.time() - start_time
         if all_blocked_analyses and not last_error:
             full_response = LLMResponse(
@@ -949,7 +949,7 @@ class IntelligentRouter:
                 locked = await self.circuit_breaker.acquire_test_lock(
                     analysis.provider, analysis.model, analysis.api_key_id)
                 if not locked:
-                    logger.info("Skipping alternative — test lock held by another request",
+                    logger.info("Skipping alternative - test lock held by another request",
                                provider=analysis.provider,
                                model=analysis.model,
                                api_key_id=analysis.api_key_id)
