@@ -3,6 +3,7 @@ Intelligent router for LLM requests
 """
 
 import asyncio
+import os
 import time
 import uuid
 import traceback
