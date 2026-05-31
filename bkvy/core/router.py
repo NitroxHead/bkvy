@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 from ..models.enums import RoutingMethod
 from ..models.data_classes import CompletionTimeAnalysis
+from ..models.circuit_states import CircuitStatus
 from ..models.schemas import (
     IntelligenceRequest, ScenarioRequest, DirectRequest, 
     LLMResponse, SimplifiedResponse, ResponseMetadata, Message, LLMOptions
@@ -39,6 +40,18 @@ class IntelligentRouter:
 
         logger.info("Router initialized with circuit breaker and timeout manager",
                    circuit_breaker_enabled=circuit_breaker.enabled if circuit_breaker else False)
+
+    def _get_rpm_for_combination(self, provider: str, model: str, api_key_id: str) -> int:
+        """Get RPM rate limit for a provider/model/key combination."""
+        try:
+            provider_config = self.config.providers.get(provider)
+            if provider_config:
+                key_config = provider_config.keys.get(api_key_id)
+                if key_config and model in key_config.rate_limits:
+                    return key_config.rate_limits[model].get('rpm', 1)
+        except (AttributeError, KeyError):
+            pass
+        return 1  # Conservative default: 1 slot
 
     async def _log_transaction(self, record: TransactionRecord):
         """Log transaction to both detailed and summary loggers if available"""
@@ -198,7 +211,40 @@ class IntelligentRouter:
                            blocked=len(blocked_analyses))
 
                 if not usable_analyses:
-                    continue
+                    # Before escalating, check if a cheaper blocked circuit reopens within time budget
+                    remaining_budget = request.max_wait_seconds - (time.time() - start_time)
+                    if remaining_budget > 1:
+                        waitable = sorted(
+                            [b for b in blocked_analyses
+                             if 0 < b['wait_time_seconds'] <= remaining_budget
+                             and b['reason'] == 'circuit_open'],
+                            key=lambda x: (x['cost_per_1k_tokens'], x['wait_time_seconds'])
+                        )
+                        for candidate in waitable:
+                            rpm = self._get_rpm_for_combination(
+                                candidate['provider'], candidate['model'], candidate['api_key_id'])
+                            if self.circuit_breaker.reserve_wait_slot(
+                                    candidate['provider'], candidate['model'],
+                                    candidate['api_key_id'], rpm):
+                                try:
+                                    wait_secs = candidate['wait_time_seconds'] + 0.5
+                                    logger.info("Waiting for cheaper circuit to reopen",
+                                               provider=candidate['provider'],
+                                               model=candidate['model'],
+                                               api_key_id=candidate['api_key_id'],
+                                               wait_seconds=wait_secs,
+                                               cost=candidate['cost_per_1k_tokens'])
+                                    await asyncio.sleep(wait_secs)
+                                    usable_analyses, _ = await self.circuit_breaker.filter_alternatives(analyses)
+                                    if usable_analyses:
+                                        break
+                                finally:
+                                    self.circuit_breaker.release_wait_slot(
+                                        candidate['provider'], candidate['model'],
+                                        candidate['api_key_id'])
+
+                    if not usable_analyses:
+                        continue
 
                 sorted_analyses = usable_analyses
             else:
@@ -625,16 +671,6 @@ class IntelligentRouter:
         last_tried_provider = None
 
         while current_alternatives:
-            # Check global timeout
-            if self.timeout_manager.should_abort(start_time):
-                elapsed = time.time() - start_time
-                self.timeout_manager.log_timeout_abort(elapsed, attempt_info["alternatives_tried"])
-
-                return {
-                    "success": False,
-                    "error": f"Hard timeout exceeded ({elapsed:.1f}s) after {attempt_info['alternatives_tried']} alternatives"
-                }, sorted_analyses[0] if sorted_analyses else None, attempt_info
-
             # Check if we should escalate to fast mode
             if not escalated and self.timeout_manager.should_escalate(start_time):
                 escalated = True
@@ -660,12 +696,27 @@ class IntelligentRouter:
             attempt_info["alternatives_tried"] += 1
             last_tried_provider = analysis.provider
 
+            # For recovery-eligible circuits (not CLOSED), acquire the test lock
+            # right before we actually send a request.  If another request already
+            # holds the lock we skip to the next alternative instead of waiting.
+            if (self.circuit_breaker and self.circuit_breaker.enabled
+                    and hasattr(analysis, 'circuit_state')
+                    and analysis.circuit_state != CircuitStatus.CLOSED):
+                locked = await self.circuit_breaker.acquire_test_lock(
+                    analysis.provider, analysis.model, analysis.api_key_id)
+                if not locked:
+                    logger.info("Skipping alternative — test lock held by another request",
+                               provider=analysis.provider,
+                               model=analysis.model,
+                               api_key_id=analysis.api_key_id)
+                    continue
+
             logger.info("Trying alternative",
                        alternative_num=attempt_info["alternatives_tried"],
                        provider=analysis.provider,
                        model=analysis.model,
                        api_key_id=analysis.api_key_id)
-            
+
             # Try this alternative up to MAX_RETRIES times
             for retry_attempt in range(1, MAX_RETRIES + 1):
                 attempt_info["total_attempts"] += 1

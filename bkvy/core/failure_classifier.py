@@ -238,6 +238,19 @@ class FailureClassifier:
 
         import re
 
+        # Gemini daily quota exhaustion (free tier RPD) — wait until midnight Pacific
+        # Two patterns:
+        # 1. "PerDay" in quotaId (e.g. gemini-2.0-flash format)
+        # 2. metric "generate_content_free_tier_requests" with limit: 20 (gemini-2.5-flash format)
+        #    — "retry in Xs" in this message is the RPM window reset, NOT the daily reset
+        error_lower_no_sep = error_lower.replace('_', '').replace('-', '')
+        is_daily_quota = (
+            ('perday' in error_lower_no_sep and 'free_tier' in error_lower)
+            or 'free_tier_requests' in error_lower
+        )
+        if is_daily_quota:
+            return cls._seconds_until_gemini_daily_reset()
+
         # Pattern: "Please retry in 43.217415972s" (Gemini format)
         gemini_pattern = re.search(r'retry in ([\d.]+)s', error_lower)
         if gemini_pattern:
@@ -299,3 +312,32 @@ class FailureClassifier:
         """Check if failure type requires health probing"""
         strategy = cls.get_strategy(failure_type)
         return strategy.requires_health_probe
+
+    @staticmethod
+    def _seconds_until_gemini_daily_reset() -> int:
+        """Calculate seconds until midnight Pacific Time (Gemini daily quota reset).
+
+        Returns value floored at 1800s (30 min) and capped at 86400s (24h).
+        """
+        from datetime import datetime, timedelta, timezone
+
+        now_utc = datetime.now(timezone.utc)
+
+        try:
+            from zoneinfo import ZoneInfo
+            pacific = ZoneInfo("America/Los_Angeles")
+            now_pacific = now_utc.astimezone(pacific)
+            midnight = (now_pacific + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            seconds = int((midnight - now_pacific).total_seconds())
+        except Exception:
+            # Fallback: assume UTC-8
+            utc_minus_8 = timezone(timedelta(hours=-8))
+            now_pacific = now_utc.astimezone(utc_minus_8)
+            midnight = (now_pacific + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            seconds = int((midnight - now_pacific).total_seconds())
+
+        return max(1800, min(seconds, 86400))

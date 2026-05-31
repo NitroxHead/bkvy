@@ -140,21 +140,16 @@ class HealthProbe:
             return (False, str(e))
 
     async def _probe_gemini(self, endpoint: str, api_key: str, model: str) -> Tuple[bool, str]:
-        """Probe Gemini using actual generation endpoint (tests rate limits)"""
+        """Probe Gemini using free models.get endpoint (no quota consumed)"""
         try:
-            # Use the actual generation endpoint to test rate limits
-            # This costs tokens but accurately tests if we can make requests
-            payload = {
-                "contents": [{"parts": [{"text": "test"}]}],
-                "generationConfig": {"maxOutputTokens": 1}
-            }
-
-            # Add API key to endpoint
-            probe_url = f"{endpoint}?key={api_key}"
+            # Use models.get instead of generateContent to avoid burning quota.
+            # Strip :generateContent suffix to get base model URL, then use models/{model} API.
+            base_url = endpoint.split("/v1beta/")[0] if "/v1beta/" in endpoint else endpoint.split("/v1/")[0]
+            probe_url = f"{base_url}/v1beta/models/{model}?key={api_key}"
 
             timeout = aiohttp.ClientTimeout(total=self.probe_timeout_seconds)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(probe_url, json=payload) as response:
+                async with session.get(probe_url) as response:
                     if response.status == 200:
                         return (True, "")
                     else:
@@ -399,7 +394,24 @@ class BackgroundProbeWorker:
         # First, clean up stuck HALF_OPEN circuits
         for circuit in self.circuit_breaker.circuits.values():
             if circuit.state == CircuitStatus.HALF_OPEN:
-                if circuit.test_probe_in_progress and circuit.test_probe_started_at:
+                if not circuit.test_probe_in_progress:
+                    # HALF_OPEN with no probe in progress — stuck (loaded from disk or
+                    # batch_probe overflow before the overflow fix). Return to OPEN.
+                    logger.warning(
+                        "Background worker clearing stuck HALF_OPEN (no probe in progress)",
+                        provider=circuit.provider,
+                        model=circuit.model,
+                        api_key_id=circuit.api_key_id,
+                    )
+                    await self.circuit_breaker._open_circuit(
+                        circuit,
+                        circuit.last_failure_type or FailureType.UNKNOWN_ERROR,
+                        None
+                    )
+                    await self.circuit_breaker.persistence.save_state(circuit)
+                    stuck_circuits_cleared += 1
+
+                elif circuit.test_probe_started_at:
                     elapsed = (now_dt - circuit.test_probe_started_at).total_seconds()
 
                     if elapsed > probe_timeout_seconds:
@@ -422,6 +434,7 @@ class BackgroundProbeWorker:
                             circuit.last_failure_type or FailureType.UNKNOWN_ERROR,
                             None
                         )
+                        await self.circuit_breaker.persistence.save_state(circuit)
 
                         stuck_circuits_cleared += 1
 
@@ -514,5 +527,8 @@ class BackgroundProbeWorker:
                         error_msg
                     )
             else:
-                # No result - clear probe lock
+                # No result - batch_probe didn't process this circuit (provider limit).
+                # Return to OPEN so the probe worker picks it up in a future cycle.
                 circuit.test_probe_in_progress = False
+                circuit.record_state_change(CircuitStatus.OPEN, "probe_batch_overflow")
+                await self.circuit_breaker.persistence.save_state(circuit)
