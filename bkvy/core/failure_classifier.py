@@ -162,7 +162,7 @@ class FailureClassifier:
         if any(phrase in error_lower for phrase in [
             "500", "502", "503", "504", "internal server error",
             "bad gateway", "service unavailable", "gateway timeout",
-            "server error", "internal error"
+            "server error", "internal error", "high demand"
         ]):
             return FailureType.SERVICE_ERROR_5XX
 
