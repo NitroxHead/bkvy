@@ -238,23 +238,34 @@ class FailureClassifier:
 
         import re
 
-        # Gemini daily quota exhaustion (free tier RPD) — wait until midnight Pacific
-        # Two patterns:
-        # 1. "PerDay" in quotaId (e.g. gemini-2.0-flash format)
-        # 2. metric "generate_content_free_tier_requests" with limit: 20 (gemini-2.5-flash format)
-        #    — "retry in Xs" in this message is the RPM window reset, NOT the daily reset
+        # Gemini provides an explicit "retry in Xs" hint on most 429s; capture it first
+        # so it can both inform the RPM-vs-RPD decision below and serve as the wait value.
+        # Pattern: "Please retry in 43.217415972s" (Gemini format).
+        gemini_retry = re.search(r'retry in ([\d.]+)s', error_lower)
+        retry_seconds = int(float(gemini_retry.group(1)) + 1) if gemini_retry else None
+
+        # Gemini daily quota (free tier RPD) exhaustion - wait until midnight Pacific.
+        # The metric "generate_content_free_tier_requests" is returned for BOTH the
+        # per-minute (RPM) throttle and the per-day (RPD) cap. Only the RPD case should
+        # bench the key until the daily reset; the RPM throttle always carries a short
+        # "retry in Xs" (tens of seconds), and honoring that lets the key keep working
+        # through the day instead of being parked for ~24h - which wastes its remaining
+        # RPD and starves the key pool. A genuine "PerDay" quotaId is always treated as
+        # daily, regardless of any retry hint.
+        rpm_window_max_seconds = 120  # RPM windows reset within ~60s; allow margin
         error_lower_no_sep = error_lower.replace('_', '').replace('-', '')
-        is_daily_quota = (
-            ('perday' in error_lower_no_sep and 'free_tier' in error_lower)
-            or 'free_tier_requests' in error_lower
+        explicit_per_day = 'perday' in error_lower_no_sep  # daily quotaId is unambiguous
+        is_free_tier_requests = 'free_tier_requests' in error_lower
+        is_daily_quota = explicit_per_day or (
+            is_free_tier_requests
+            and (retry_seconds is None or retry_seconds > rpm_window_max_seconds)
         )
         if is_daily_quota:
             return cls._seconds_until_gemini_daily_reset()
 
-        # Pattern: "Please retry in 43.217415972s" (Gemini format)
-        gemini_pattern = re.search(r'retry in ([\d.]+)s', error_lower)
-        if gemini_pattern:
-            return int(float(gemini_pattern.group(1)) + 1)  # Round up
+        # Short per-minute / transient rate-limit window - honor Gemini's explicit hint.
+        if retry_seconds is not None:
+            return retry_seconds
 
         # Pattern: "retry after 60 seconds"
         retry_pattern = re.search(r'retry after (\d+) seconds?', error_lower)
