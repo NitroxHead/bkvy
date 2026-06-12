@@ -395,7 +395,7 @@ class BackgroundProbeWorker:
         for circuit in self.circuit_breaker.circuits.values():
             if circuit.state == CircuitStatus.HALF_OPEN:
                 if not circuit.test_probe_in_progress:
-                    # HALF_OPEN with no probe in progress — stuck (loaded from disk or
+                    # HALF_OPEN with no probe in progress - stuck (loaded from disk or
                     # batch_probe overflow before the overflow fix). Return to OPEN.
                     logger.warning(
                         "Background worker clearing stuck HALF_OPEN (no probe in progress)",

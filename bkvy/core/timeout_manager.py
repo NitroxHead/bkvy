@@ -69,7 +69,7 @@ class GlobalTimeoutManager:
 
     def get_request_timeout(self, start_time: float, escalated: bool, default_timeout: int = 300) -> int:
         """
-        Calculate per-attempt timeout — capped so one slow provider can't starve fallbacks.
+        Calculate per-attempt timeout - capped so one slow provider can't starve fallbacks.
 
         Args:
             start_time: Request start timestamp

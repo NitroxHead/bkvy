@@ -193,7 +193,7 @@ class CircuitBreakerManager:
                 )
 
         if circuit.state == CircuitStatus.HALF_OPEN:
-            # Any failure during recovery testing means test failed — always reopen.
+            # Any failure during recovery testing means test failed - always reopen.
             # should_circuit_break governs CLOSED→OPEN transitions, not HALF_OPEN→OPEN.
             await self._open_circuit(circuit, failure_type, response_headers)
         elif should_open and circuit.state != CircuitStatus.OPEN:
@@ -409,7 +409,7 @@ class CircuitBreakerManager:
 
             if now >= circuit.next_test_time:
                 # Circuit is ready for recovery testing.
-                # Don't acquire probe lock here — filter_alternatives() calls this
+                # Don't acquire probe lock here - filter_alternatives() calls this
                 # for ALL alternatives, but only one will actually be tried. Locking
                 # here would orphan locks on every circuit that isn't picked.
                 # The lock is acquired in acquire_test_lock() when the circuit is
