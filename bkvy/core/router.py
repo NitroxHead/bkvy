@@ -3,6 +3,7 @@ Intelligent router for LLM requests
 """
 
 import asyncio
+import os
 import time
 import uuid
 import traceback
@@ -160,6 +161,249 @@ class IntelligentRouter:
             if tracker:
                 await tracker.remove(request_id)
 
+    async def route_intelligence_request_stream(self, request: IntelligenceRequest):
+        """Streaming variant of route_intelligence_request.
+
+        Async generator yielding normalized events:
+          {"type": "start", "request_id", "provider", "model", "api_key_id"}  (once, at first token)
+          {"type": "delta", "content": "<chunk>"}
+          {"type": "done",  "finish_reason", "usage", "model_used", "request_id"}
+          {"type": "error", "error", "request_id"}  (terminal failure)
+
+        Resilience contract ("no request lost"):
+          * Failures BEFORE the first token fall back across every alternative
+            and every tier - identical to the synchronous path.
+          * Once the first token is forwarded the request is committed; a
+            mid-stream break ends with an explicit "error" event (never a
+            silent truncation), so the caller can retry safely.
+        """
+        logger.info("Processing intelligence-based STREAMING request",
+                   client_id=request.client_id,
+                   intelligence_level=request.intelligence_level,
+                   max_wait=request.max_wait_seconds)
+
+        start_time = time.time()
+        request_id = str(uuid.uuid4())
+
+        tracker = get_pending_tracker()
+        if tracker:
+            await tracker.add(request_id, request.client_id, "intelligence",
+                              request.intelligence_level.value, request.max_wait_seconds)
+        try:
+            async for event in self._route_intelligence_stream_inner(request, request_id, start_time):
+                yield event
+        finally:
+            if tracker:
+                await tracker.remove(request_id)
+
+    async def _route_intelligence_stream_inner(self, request: IntelligenceRequest,
+                                               request_id: str, start_time: float):
+        """Inner streaming logic: tier escalation + circuit-breaker filtering, then stream."""
+        transaction_logger = get_transaction_logger()
+        transaction_record = None
+        if transaction_logger:
+            transaction_record = transaction_logger.create_record(
+                request_id=request_id, client_id=request.client_id, routing_method="intelligence")
+            transaction_record.intelligence_level = request.intelligence_level.value
+            transaction_record.max_wait_seconds = request.max_wait_seconds
+
+        tier_order = {"low": ["low", "medium", "high"],
+                      "medium": ["medium", "low", "high"],
+                      "high": ["high", "medium", "low"]}
+        tiers_to_try = tier_order.get(request.intelligence_level.value,
+                                      [request.intelligence_level.value])
+
+        last_error = None
+        committed = False  # becomes True once we forward the first token
+
+        for tier in tiers_to_try:
+            model_combinations = self.config.get_models_by_intelligence(tier)
+            if not model_combinations:
+                continue
+
+            analyses = await self._analyze_all_combinations(model_combinations, request.max_wait_seconds)
+            if not analyses:
+                continue
+
+            if self.circuit_breaker and self.circuit_breaker.enabled:
+                usable_analyses, _blocked = await self.circuit_breaker.filter_alternatives(analyses)
+                if not usable_analyses:
+                    continue
+                sorted_analyses = usable_analyses
+            else:
+                sorted_analyses = sorted(analyses, key=lambda x: (x.cost_per_1k_tokens, x.total_seconds))
+
+            # Stream through this tier's alternatives. The generator yields events;
+            # the final event tells us whether it succeeded, failed pre-commit
+            # (fall back to next tier), or broke mid-stream (terminal).
+            async for event in self._execute_with_fallback_stream(
+                    sorted_analyses, request.messages, request.options, start_time, request_id):
+                etype = event.get("type")
+                if etype == "_committed":
+                    committed = True
+                    continue
+                if etype == "_tier_failed":
+                    last_error = event.get("error", "all alternatives failed")
+                    break  # try next tier
+                if etype == "done":
+                    total_time = time.time() - start_time
+                    await self._log_stream_transaction(
+                        transaction_record, event, total_time, success=True)
+                    yield event
+                    return
+                # start / delta / error pass straight through to the client
+                yield event
+                if etype == "error":
+                    total_time = time.time() - start_time
+                    await self._log_failed_transaction(
+                        transaction_record, "stream_broken_mid_flight",
+                        event.get("error", "mid-stream failure"), total_time)
+                    return
+            else:
+                # generator exhausted without done/error/_tier_failed → done already handled
+                if committed:
+                    return
+
+            if committed:
+                return
+
+        # All tiers exhausted before any token was sent.
+        total_time = time.time() - start_time
+        msg = f"All alternatives across all tiers failed. Last error: {last_error}" if last_error \
+            else "No models available for any intelligence level"
+        await self._log_failed_transaction(transaction_record, "all_alternatives_failed", msg, total_time)
+        yield {"type": "error", "error": msg, "request_id": request_id}
+
+    async def _execute_with_fallback_stream(self, sorted_analyses: List[CompletionTimeAnalysis],
+                                            messages: List[Message], options: Optional[LLMOptions],
+                                            start_time: float, request_id: str):
+        """Try each alternative as a stream; fall back only before the first token.
+
+        Yields client-facing events (start/delta/done/error) plus internal
+        control events:
+          {"type": "_committed"}     after first token forwarded (no more fallback)
+          {"type": "_tier_failed", "error": ...}  every alt failed pre-commit
+        """
+        idle_timeout = int(os.getenv("STREAM_IDLE_TIMEOUT", "60"))
+        last_error = "no alternatives"
+
+        for analysis in sorted_analyses:
+            # Acquire recovery test lock for non-CLOSED circuits, same as sync path.
+            if (self.circuit_breaker and self.circuit_breaker.enabled
+                    and hasattr(analysis, 'circuit_state')
+                    and analysis.circuit_state != CircuitStatus.CLOSED):
+                locked = await self.circuit_breaker.acquire_test_lock(
+                    analysis.provider, analysis.model, analysis.api_key_id)
+                if not locked:
+                    continue
+
+            provider_config = self.config.providers[analysis.provider]
+            key_config = provider_config.keys[analysis.api_key_id]
+            model_config = provider_config.models[analysis.model]
+            options_dict = self._prepare_options_dict(analysis, options)
+            msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+
+            if request_id:
+                tracker = get_pending_tracker()
+                if tracker:
+                    await tracker.update(request_id, analysis.provider, analysis.model, analysis.api_key_id)
+
+            first_token_seen = False
+            agg_content = []
+            try:
+                # Enforce rate limit before opening the stream (mirrors sync path).
+                await self.queues._wait_for_rate_limit(
+                    analysis.provider, analysis.model, analysis.api_key_id,
+                    self.rate_limits, self.config)
+                await self.rate_limits.record_request(
+                    analysis.provider, analysis.model, analysis.api_key_id)
+
+                stream = self.llm_client._make_api_call_stream(
+                    provider=analysis.provider, model=analysis.model,
+                    api_key=key_config.api_key, messages=msg_dicts,
+                    options=options_dict, endpoint=model_config.endpoint,
+                    version=getattr(model_config, 'version', None),
+                )
+
+                stream_iter = stream.__aiter__()
+                while True:
+                    try:
+                        event = await asyncio.wait_for(stream_iter.__anext__(), timeout=idle_timeout)
+                    except StopAsyncIteration:
+                        break
+
+                    if event["type"] == "delta":
+                        if not first_token_seen:
+                            first_token_seen = True
+                            yield {"type": "_committed"}
+                            yield {"type": "start", "request_id": request_id,
+                                   "provider": analysis.provider, "model": analysis.model,
+                                   "api_key_id": analysis.api_key_id}
+                        agg_content.append(event["content"])
+                        yield {"type": "delta", "content": event["content"]}
+
+                    elif event["type"] == "done":
+                        if self.circuit_breaker and self.circuit_breaker.enabled:
+                            await self.circuit_breaker.record_success(
+                                analysis.provider, analysis.model, analysis.api_key_id, None)
+                        yield {
+                            "type": "done",
+                            "request_id": request_id,
+                            "model_used": analysis.model,
+                            "provider_used": analysis.provider,
+                            "api_key_used": analysis.api_key_id,
+                            "finish_reason": event.get("finish_reason", "stop"),
+                            "usage": event.get("usage", {}),
+                            "cost_per_1k_tokens": analysis.cost_per_1k_tokens,
+                            "content": "".join(agg_content),
+                        }
+                        return
+
+            except Exception as e:
+                error_msg = str(e)
+                last_error = error_msg
+                # Record failure with the circuit breaker (pre- or post-commit alike).
+                if self.circuit_breaker and self.circuit_breaker.enabled:
+                    await self.circuit_breaker.record_failure(
+                        analysis.provider, analysis.model, analysis.api_key_id,
+                        error_msg, status_code=None, response_time_ms=None, response_headers=None)
+
+                if first_token_seen:
+                    # Committed - cannot fall back without splicing models. Terminal.
+                    logger.error("Stream broke after first token; emitting error event",
+                                provider=analysis.provider, model=analysis.model, error=error_msg)
+                    yield {"type": "error",
+                           "error": f"Stream interrupted after partial output: {error_msg}",
+                           "request_id": request_id}
+                    return
+                # Pre-commit failure → try next alternative.
+                logger.warning("Stream alternative failed before first token, falling back",
+                              provider=analysis.provider, model=analysis.model, error=error_msg)
+                continue
+
+        # Every alternative in this tier failed before producing a token.
+        yield {"type": "_tier_failed", "error": last_error}
+
+    async def _log_stream_transaction(self, transaction_record, done_event: Dict[str, Any],
+                                      total_time: float, success: bool):
+        """Finalize the transaction log for a completed stream (usage known at end)."""
+        if not transaction_record:
+            return
+        transaction_record.success = success
+        transaction_record.provider_used = done_event.get("provider_used")
+        transaction_record.model_used = done_event.get("model_used")
+        transaction_record.api_key_used = done_event.get("api_key_used")
+        transaction_record.total_time_ms = int(total_time * 1000)
+        transaction_record.decision_reason = "streaming_cheapest_within_estimate"
+        usage = done_event.get("usage") or {}
+        transaction_record.input_tokens = usage.get("input_tokens")
+        transaction_record.output_tokens = usage.get("output_tokens")
+        if transaction_record.input_tokens and transaction_record.output_tokens:
+            total_tokens = transaction_record.input_tokens + transaction_record.output_tokens
+            transaction_record.cost_estimate = (total_tokens / 1000) * done_event.get("cost_per_1k_tokens", 0)
+        transaction_record.finish_reason = done_event.get("finish_reason")
+        await self._log_transaction(transaction_record)
+
     async def _route_intelligence_inner(self, request: IntelligenceRequest, request_id: str, start_time: float) -> LLMResponse:
         """Inner logic for route_intelligence_request"""
         # Create transaction record
@@ -289,14 +533,14 @@ class IntelligentRouter:
                     return self._create_simplified_response(full_response)
                 return full_response
             else:
-                # This tier's alternatives all failed at runtime — try next tier
+                # This tier's alternatives all failed at runtime - try next tier
                 last_error = result.get('error', 'Unknown error')
                 logger.warning("All alternatives failed for tier, escalating",
                               tier=tier,
                               error=last_error)
                 continue
 
-        # All tiers exhausted — log failure
+        # All tiers exhausted - log failure
         total_time = time.time() - start_time
         if all_blocked_analyses and not last_error:
             full_response = LLMResponse(
@@ -705,7 +949,7 @@ class IntelligentRouter:
                 locked = await self.circuit_breaker.acquire_test_lock(
                     analysis.provider, analysis.model, analysis.api_key_id)
                 if not locked:
-                    logger.info("Skipping alternative — test lock held by another request",
+                    logger.info("Skipping alternative - test lock held by another request",
                                provider=analysis.provider,
                                model=analysis.model,
                                api_key_id=analysis.api_key_id)
@@ -1016,25 +1260,35 @@ class IntelligentRouter:
         
         return same_provider_reordered + other_providers
     
-    async def _execute_request(self, analysis: CompletionTimeAnalysis, 
+    def _prepare_options_dict(self, analysis: CompletionTimeAnalysis,
+                              options: Optional[LLMOptions]) -> Dict[str, Any]:
+        """Build the options dict with automatic thinking control.
+
+        Shared by the synchronous and streaming execution paths so low-tier
+        thinking auto-disable behaves identically in both.
+        """
+        model_config = self.config.providers[analysis.provider].models[analysis.model]
+        options_dict = options.dict() if options else {}
+
+        if options_dict.get("disable_thinking") is None:
+            if model_config.intelligence_tier == "low" and model_config.supports_thinking:
+                options_dict["disable_thinking"] = True
+                logger.info("Auto-disabled thinking for low intelligence model",
+                           provider=analysis.provider, model=analysis.model,
+                           intelligence_tier=model_config.intelligence_tier,
+                           supports_thinking=model_config.supports_thinking)
+        return options_dict
+
+    async def _execute_request(self, analysis: CompletionTimeAnalysis,
                              messages: List[Message], options: Optional[LLMOptions]) -> Dict[str, Any]:
         """Execute request to selected combination and wait for response - NO TIMEOUT"""
         provider_config = self.config.providers[analysis.provider]
         key_config = provider_config.keys[analysis.api_key_id]
         model_config = provider_config.models[analysis.model]
-        
-        # Prepare options with automatic thinking control
-        options_dict = options.dict() if options else {}
-        
-        # Automatically disable thinking for low intelligence models if not explicitly set
-        if options_dict.get("disable_thinking") is None:
-            if model_config.intelligence_tier == "low" and model_config.supports_thinking:
-                options_dict["disable_thinking"] = True
-                logger.info("Auto-disabled thinking for low intelligence model", 
-                           provider=analysis.provider, model=analysis.model, 
-                           intelligence_tier=model_config.intelligence_tier,
-                           supports_thinking=model_config.supports_thinking)
-        
+
+        # Prepare options with automatic thinking control (shared helper)
+        options_dict = self._prepare_options_dict(analysis, options)
+
         request_data = {
             "provider": analysis.provider,
             "model": analysis.model,

@@ -2,9 +2,10 @@
 LLM client for making API calls to providers
 """
 
+import json
 import aiohttp
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, AsyncGenerator
 
 from ..utils.logging import setup_logging
 
@@ -55,11 +56,11 @@ class LLMClient:
             logger.warning("Ollama health check failed with exception", error=str(e))
             return False
 
-    async def _make_api_call(self, provider: str, model: str, api_key: str, 
-                           messages: List[Dict], options: Dict, 
+    async def _make_api_call(self, provider: str, model: str, api_key: str,
+                           messages: List[Dict], options: Dict,
                            endpoint: str, version: Optional[str] = None) -> Dict[str, Any]:
         """Make API call to specific provider"""
-        
+
         if provider == "gemini":
             return await self._call_gemini(endpoint, api_key, messages, options)
         elif provider == "openai":
@@ -70,6 +71,318 @@ class LLMClient:
             return await self._call_ollama(endpoint, api_key, model, messages, options)
         else:
             raise ValueError(f"Unsupported provider: {provider}")
+
+    async def _make_api_call_stream(self, provider: str, model: str, api_key: str,
+                                    messages: List[Dict], options: Dict,
+                                    endpoint: str, version: Optional[str] = None
+                                    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Make a STREAMING API call to a provider.
+
+        Yields normalized events:
+          {"type": "delta", "content": "<text chunk>"}
+          {"type": "done",  "finish_reason": <str>, "usage": {input_tokens, output_tokens, total_tokens}}
+
+        The FIRST event yielded is significant: until a "delta" (or "done") is
+        produced, the caller may still fall back to another provider. Any
+        exception raised BEFORE the first event is a clean pre-first-token
+        failure and is safe to fall back on. An exception AFTER the first delta
+        means the stream broke mid-flight (the caller is already committed).
+        """
+        if provider == "gemini":
+            gen = self._stream_gemini(endpoint, api_key, messages, options)
+        elif provider == "openai":
+            gen = self._stream_openai(endpoint, api_key, model, messages, options)
+        elif provider == "anthropic":
+            gen = self._stream_anthropic(endpoint, api_key, model, messages, options, version)
+        elif provider == "ollama":
+            gen = self._stream_ollama(endpoint, api_key, model, messages, options)
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
+
+        async for event in gen:
+            yield event
+
+    @staticmethod
+    async def _iter_sse_lines(response) -> AsyncGenerator[str, None]:
+        """Yield 'data:' payloads from an SSE response, one per event."""
+        async for raw in response.content:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                yield line[len("data:"):].strip()
+
+    async def _stream_gemini(self, endpoint: str, api_key: str,
+                             messages: List[Dict], options: Dict
+                             ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream from Gemini via streamGenerateContent?alt=sse."""
+        contents = []
+        for msg in messages:
+            if msg["role"] == "user":
+                contents.append({"parts": [{"text": msg["content"]}]})
+            elif msg["role"] == "assistant":
+                contents.append({"parts": [{"text": msg["content"]}], "role": "model"})
+            elif msg["role"] == "system":
+                contents.insert(0, {"parts": [{"text": f"System: {msg['content']}"}]})
+
+        payload = {"contents": contents}
+        if options:
+            generation_config = {}
+            if options.get("max_tokens") is not None:
+                generation_config["maxOutputTokens"] = max(options["max_tokens"], 50)
+            if options.get("temperature") is not None:
+                generation_config["temperature"] = options["temperature"]
+            if options.get("top_p") is not None:
+                generation_config["topP"] = options["top_p"]
+            if options.get("top_k") is not None:
+                generation_config["topK"] = options["top_k"]
+            if options.get("disable_thinking"):
+                generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+            if generation_config:
+                payload["generationConfig"] = generation_config
+
+        # Convert ":generateContent" endpoint to streaming form.
+        stream_endpoint = endpoint.replace(":generateContent", ":streamGenerateContent")
+        sep = "&" if "?" in stream_endpoint else "?"
+        stream_endpoint = f"{stream_endpoint}{sep}alt=sse"
+
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+
+        input_tokens = output_tokens = total_tokens = 0
+        finish_reason = None
+        async with self.session.post(stream_endpoint, json=payload, headers=headers) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"Gemini API error {response.status}: {error_text}")
+            async for data in self._iter_sse_lines(response):
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                candidates = chunk.get("candidates") or []
+                if candidates:
+                    cand = candidates[0]
+                    fr = cand.get("finishReason")
+                    if fr:
+                        finish_reason = fr
+                    for part in (cand.get("content", {}) or {}).get("parts", []) or []:
+                        text = part.get("text")
+                        if text:
+                            yield {"type": "delta", "content": text}
+                usage_md = chunk.get("usageMetadata")
+                if usage_md:
+                    input_tokens = usage_md.get("promptTokenCount", input_tokens)
+                    output_tokens = usage_md.get("candidatesTokenCount", output_tokens)
+                    total_tokens = usage_md.get("totalTokenCount", input_tokens + output_tokens)
+
+        yield {
+            "type": "done",
+            "finish_reason": (finish_reason or "stop"),
+            "truncated": finish_reason == "MAX_TOKENS",
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens or (input_tokens + output_tokens),
+            },
+        }
+
+    async def _stream_openai(self, endpoint: str, api_key: str, model: str,
+                             messages: List[Dict], options: Dict
+                             ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream from OpenAI Chat Completions (SSE)."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if options.get("max_tokens") is not None:
+            payload["max_tokens"] = options["max_tokens"]
+        if options.get("temperature") is not None:
+            payload["temperature"] = max(0.0, min(2.0, options["temperature"]))
+        if options.get("top_p") is not None:
+            payload["top_p"] = max(0.0, min(1.0, options["top_p"]))
+        if options.get("stop") is not None:
+            payload["stop"] = options["stop"]
+        if options.get("disable_thinking"):
+            payload["reasoning"] = {"effort": "low"}
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+        input_tokens = output_tokens = total_tokens = 0
+        finish_reason = None
+        async with self.session.post(endpoint, json=payload, headers=headers) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"OpenAI API error {response.status}: {error_text}")
+            async for data in self._iter_sse_lines(response):
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta", {}) or {}
+                    text = delta.get("content")
+                    if text:
+                        yield {"type": "delta", "content": text}
+                    fr = choices[0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                usage = chunk.get("usage")
+                if usage:
+                    input_tokens = usage.get("prompt_tokens", input_tokens)
+                    output_tokens = usage.get("completion_tokens", output_tokens)
+                    total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+
+        yield {
+            "type": "done",
+            "finish_reason": (finish_reason or "stop"),
+            "truncated": finish_reason == "length",
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens or (input_tokens + output_tokens),
+            },
+        }
+
+    async def _stream_anthropic(self, endpoint: str, api_key: str, model: str,
+                                messages: List[Dict], options: Dict, version: str
+                                ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream from Anthropic Messages API (SSE)."""
+        anthropic_messages = []
+        system_message = None
+        for msg in messages:
+            if msg["role"] == "system":
+                system_message = msg["content"]
+            else:
+                anthropic_messages.append({"role": msg["role"], "content": msg["content"]})
+
+        payload = {
+            "model": model,
+            "messages": anthropic_messages,
+            "max_tokens": options.get("max_tokens", 1024),
+            "stream": True,
+        }
+        if system_message:
+            payload["system"] = system_message
+        if options.get("temperature") is not None:
+            payload["temperature"] = max(0.0, min(1.0, options["temperature"]))
+        if options.get("top_p") is not None:
+            payload["top_p"] = max(0.0, min(1.0, options["top_p"]))
+        if options.get("top_k") is not None:
+            payload["top_k"] = max(1, options["top_k"])
+        if options.get("stop") is not None:
+            payload["stop_sequences"] = options["stop"]
+        if options.get("disable_thinking"):
+            payload["thinking"] = {"type": "enabled", "budget_tokens": 0}
+
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": version or "2023-06-01",
+            "Content-Type": "application/json",
+        }
+
+        input_tokens = output_tokens = 0
+        finish_reason = None
+        async with self.session.post(endpoint, json=payload, headers=headers) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"Anthropic API error {response.status}: {error_text}")
+            async for data in self._iter_sse_lines(response):
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type")
+                if etype == "message_start":
+                    usage = (event.get("message", {}) or {}).get("usage", {}) or {}
+                    input_tokens = usage.get("input_tokens", input_tokens)
+                elif etype == "content_block_delta":
+                    delta = event.get("delta", {}) or {}
+                    text = delta.get("text")
+                    if text:
+                        yield {"type": "delta", "content": text}
+                elif etype == "message_delta":
+                    delta = event.get("delta", {}) or {}
+                    if delta.get("stop_reason"):
+                        finish_reason = delta["stop_reason"]
+                    usage = event.get("usage", {}) or {}
+                    if usage.get("output_tokens") is not None:
+                        output_tokens = usage["output_tokens"]
+                elif etype == "error":
+                    err = event.get("error", {}) or {}
+                    raise Exception(f"Anthropic stream error: {err.get('message', 'unknown')}")
+
+        yield {
+            "type": "done",
+            "finish_reason": (finish_reason or "stop"),
+            "truncated": finish_reason == "max_tokens",
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+        }
+
+    async def _stream_ollama(self, endpoint: str, api_key: str, model: str,
+                             messages: List[Dict], options: Dict
+                             ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream from Ollama chat API (newline-delimited JSON)."""
+        payload = {"model": model, "messages": messages, "stream": True}
+        opt = {}
+        if options.get("max_tokens") is not None:
+            opt["num_predict"] = options["max_tokens"]
+        if options.get("temperature") is not None:
+            opt["temperature"] = max(0.0, min(2.0, options["temperature"]))
+        if options.get("top_p") is not None:
+            opt["top_p"] = max(0.0, min(1.0, options["top_p"]))
+        if options.get("top_k") is not None:
+            opt["top_k"] = max(1, options["top_k"])
+        if options.get("stop") is not None:
+            opt["stop"] = options["stop"]
+        if opt:
+            payload["options"] = opt
+
+        headers = {"Content-Type": "application/json"}
+
+        input_tokens = output_tokens = 0
+        finish_reason = None
+        async with self.session.post(endpoint, json=payload, headers=headers) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"Ollama API error {response.status}: {error_text}")
+            async for raw in response.content:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = chunk.get("message") or {}
+                text = msg.get("content")
+                if text:
+                    yield {"type": "delta", "content": text}
+                if chunk.get("done"):
+                    finish_reason = chunk.get("done_reason", "stop")
+                    input_tokens = chunk.get("prompt_eval_count", input_tokens)
+                    output_tokens = chunk.get("eval_count", output_tokens)
+
+        yield {
+            "type": "done",
+            "finish_reason": (finish_reason or "stop"),
+            "truncated": False,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+        }
     
     async def _call_gemini(self, endpoint: str, api_key: str, 
                           messages: List[Dict], options: Dict) -> Dict[str, Any]:
