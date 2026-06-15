@@ -3,6 +3,7 @@ Queue management for bkvy
 """
 
 import asyncio
+import os
 import time
 import uuid
 import traceback
@@ -143,6 +144,12 @@ class QueueManager:
         key_config = provider_config.keys[api_key_id]
         rate_limits = key_config.rate_limits[model]
         
+        # Cap how long one request may block on rate-limit clearance. An
+        # RPD-exhausted key reports a wait of many hours; parking a request
+        # there guarantees a client-side timeout and starves throughput. When
+        # the wait exceeds the cap, fail fast so the router fails over to an
+        # RPM-recoverable key (RPM windows clear within ~60s). 0 disables the cap.
+        max_wait = int(os.getenv("RATE_LIMIT_MAX_WAIT_SECONDS", "120"))
         while True:
             is_limited, wait_time = await rate_limit_manager.check_rate_limit_status(
                 provider, model, api_key_id, rate_limits["rpm"], rate_limits["rpd"]
@@ -150,6 +157,14 @@ class QueueManager:
             
             if not is_limited:
                 break
+            
+            if max_wait and wait_time > max_wait:
+                # Surface as a rate-limit error so the router benches this key
+                # (retry hint) and tries the next alternative immediately.
+                raise Exception(
+                    f"rate limit: wait {wait_time:.0f}s exceeds cap {max_wait}s; "
+                    f"please retry in {int(wait_time)}s"
+                )
             
             logger.info("Waiting for rate limit", 
                        provider=provider, model=model, api_key_id=api_key_id,
