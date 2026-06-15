@@ -198,6 +198,15 @@ class CircuitBreakerManager:
             await self._open_circuit(circuit, failure_type, response_headers)
         elif should_open and circuit.state != CircuitStatus.OPEN:
             await self._open_circuit(circuit, failure_type, response_headers)
+        elif (
+            circuit.state == CircuitStatus.OPEN
+            and circuit.next_test_time is None
+            and failure_type != FailureType.AUTH_ERROR_4XX
+        ):
+            # Failure recorded against an already-OPEN circuit that has no recovery
+            # schedule (non-auth). Without this, next_test_time stays None forever and
+            # should_attempt_recovery would strand the key. Re-open to re-arm it.
+            await self._open_circuit(circuit, failure_type, response_headers)
 
         # Persist state
         await self.persistence.save_state(circuit)
@@ -404,8 +413,24 @@ class CircuitBreakerManager:
             now = datetime.now(timezone.utc)
 
             if circuit.next_test_time is None:
-                # Auth errors never auto-recover
-                return (False, 999999, "auth_failure_requires_manual_fix")
+                # A genuine auth failure is intentionally parked forever
+                # (set in _open_circuit). But next_test_time can also be None on
+                # a recoverable circuit whose schedule was never armed - e.g. a
+                # failure recorded against an already-OPEN circuit, or a stale
+                # state loaded from disk. Treating those as auth failures strands
+                # the key permanently. Only AUTH errors stay parked; anything
+                # else is re-armed for an immediate recovery probe.
+                if circuit.last_failure_type == FailureType.AUTH_ERROR_4XX:
+                    return (False, 999999, "auth_failure_requires_manual_fix")
+                logger.warning(
+                    "OPEN circuit had no next_test_time but is not an auth failure; "
+                    "re-arming for recovery",
+                    provider=circuit.provider,
+                    model=circuit.model,
+                    api_key_id=circuit.api_key_id,
+                    last_failure_type=circuit.last_failure_type.value if circuit.last_failure_type else None,
+                )
+                return (True, 0, "recovery_reschedule")
 
             if now >= circuit.next_test_time:
                 # Circuit is ready for recovery testing.
