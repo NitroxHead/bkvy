@@ -21,6 +21,7 @@ class FailureType(str, Enum):
     RATE_LIMIT_429 = "rate_limit_429"
     SERVICE_ERROR_5XX = "service_error_5xx"
     AUTH_ERROR_4XX = "auth_error_4xx"
+    MODEL_ERROR = "model_error"        # model not found / retired / no access
     TIMEOUT_ERROR = "timeout_error"
     CONTENT_ERROR = "content_error"
     UNKNOWN_ERROR = "unknown_error"
@@ -208,6 +209,8 @@ class CircuitState:
             max_backoff = 1800   # 30 minutes
         elif failure_type == FailureType.TIMEOUT_ERROR:
             max_backoff = 300    # 5 minutes
+        elif failure_type == FailureType.MODEL_ERROR:
+            max_backoff = 86400  # 24 hours - needs a config fix, probe rarely
         elif failure_type == FailureType.AUTH_ERROR_4XX:
             max_backoff = 999999999  # Effectively infinite
         else:

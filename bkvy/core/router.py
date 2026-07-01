@@ -54,6 +54,24 @@ class IntelligentRouter:
             pass
         return 1  # Conservative default: 1 slot
 
+    @staticmethod
+    def _tiers_to_try(requested: str) -> List[str]:
+        """Fallback order for intelligence tiers.
+
+        Requested tier first, then escalation to HIGHER tiers (quality is
+        preserved, only cost increases). Downgrading to lower tiers is a last
+        resort - it answers with a weaker model than the caller asked for -
+        and can be disabled entirely with TIER_DOWNGRADE_ENABLED=false.
+        """
+        ladder = ["low", "medium", "high"]
+        if requested not in ladder:
+            return [requested]
+        idx = ladder.index(requested)
+        tiers = [requested] + ladder[idx + 1:]
+        if os.getenv("TIER_DOWNGRADE_ENABLED", "true").lower() == "true":
+            tiers += list(reversed(ladder[:idx]))
+        return tiers
+
     async def _log_transaction(self, record: TransactionRecord):
         """Log transaction to both detailed and summary loggers if available"""
         # Log to detailed transaction logger (CSV)
@@ -207,16 +225,18 @@ class IntelligentRouter:
             transaction_record.intelligence_level = request.intelligence_level.value
             transaction_record.max_wait_seconds = request.max_wait_seconds
 
-        tier_order = {"low": ["low", "medium", "high"],
-                      "medium": ["medium", "low", "high"],
-                      "high": ["high", "medium", "low"]}
-        tiers_to_try = tier_order.get(request.intelligence_level.value,
-                                      [request.intelligence_level.value])
+        tiers_to_try = self._tiers_to_try(request.intelligence_level.value)
 
         last_error = None
         committed = False  # becomes True once we forward the first token
 
         for tier in tiers_to_try:
+            # No token sent yet - respect the hard timeout before trying
+            # another tier's alternatives.
+            if self.timeout_manager.should_abort(start_time):
+                last_error = f"hard timeout ({self.timeout_manager.hard_timeout_seconds}s) exceeded"
+                break
+
             model_combinations = self.config.get_models_by_intelligence(tier)
             if not model_combinations:
                 continue
@@ -288,6 +308,13 @@ class IntelligentRouter:
         last_error = "no alternatives"
 
         for analysis in sorted_analyses:
+            # This point is only reached pre-commit (post-commit paths return),
+            # so the hard timeout applies: don't start yet another alternative
+            # once the budget is spent.
+            if self.timeout_manager.should_abort(start_time):
+                last_error = f"hard timeout ({self.timeout_manager.hard_timeout_seconds}s) exceeded"
+                break
+
             # Acquire recovery test lock for non-CLOSED circuits, same as sync path.
             if (self.circuit_breaker and self.circuit_breaker.enabled
                     and hasattr(analysis, 'circuit_state')
@@ -309,14 +336,15 @@ class IntelligentRouter:
                     await tracker.update(request_id, analysis.provider, analysis.model, analysis.api_key_id)
 
             first_token_seen = False
+            done_seen = False
             agg_content = []
+            self.queues.note_inflight_start(analysis.provider, analysis.model, analysis.api_key_id)
             try:
-                # Enforce rate limit before opening the stream (mirrors sync path).
-                await self.queues._wait_for_rate_limit(
+                # Atomically consume a rate-limit slot before opening the stream
+                # (mirrors sync path; closes the check-then-record race).
+                await self.queues.acquire_rate_slot(
                     analysis.provider, analysis.model, analysis.api_key_id,
                     self.rate_limits, self.config)
-                await self.rate_limits.record_request(
-                    analysis.provider, analysis.model, analysis.api_key_id)
 
                 stream = self.llm_client._make_api_call_stream(
                     provider=analysis.provider, model=analysis.model,
@@ -343,6 +371,7 @@ class IntelligentRouter:
                         yield {"type": "delta", "content": event["content"]}
 
                     elif event["type"] == "done":
+                        done_seen = True
                         if self.circuit_breaker and self.circuit_breaker.enabled:
                             await self.circuit_breaker.record_success(
                                 analysis.provider, analysis.model, analysis.api_key_id, None)
@@ -359,14 +388,26 @@ class IntelligentRouter:
                         }
                         return
 
+                if not done_seen:
+                    # The provider generator ended without a "done" event. If
+                    # tokens were already forwarded, falling through to the next
+                    # alternative would splice a second model's output onto this
+                    # stream. Raise so the handler below terminates (post-commit)
+                    # or falls back cleanly (pre-commit).
+                    raise RuntimeError("stream ended without completion event")
+
             except Exception as e:
                 error_msg = str(e)
                 last_error = error_msg
-                # Record failure with the circuit breaker (pre- or post-commit alike).
+                # Record failure with the circuit breaker (pre- or post-commit
+                # alike), with status/headers when the provider supplied them.
                 if self.circuit_breaker and self.circuit_breaker.enabled:
                     await self.circuit_breaker.record_failure(
                         analysis.provider, analysis.model, analysis.api_key_id,
-                        error_msg, status_code=None, response_time_ms=None, response_headers=None)
+                        error_msg,
+                        status_code=getattr(e, "status_code", None),
+                        response_time_ms=None,
+                        response_headers=getattr(e, "headers", None))
 
                 if first_token_seen:
                     # Committed - cannot fall back without splicing models. Terminal.
@@ -380,6 +421,8 @@ class IntelligentRouter:
                 logger.warning("Stream alternative failed before first token, falling back",
                               provider=analysis.provider, model=analysis.model, error=error_msg)
                 continue
+            finally:
+                self.queues.note_inflight_end(analysis.provider, analysis.model, analysis.api_key_id)
 
         # Every alternative in this tier failed before producing a token.
         yield {"type": "_tier_failed", "error": last_error}
@@ -418,15 +461,20 @@ class IntelligentRouter:
             transaction_record.intelligence_level = request.intelligence_level.value
             transaction_record.max_wait_seconds = request.max_wait_seconds
 
-        # Build tier escalation order: requested tier first, then others by cost
-        tier_order = {"low": ["low", "medium", "high"], "medium": ["medium", "low", "high"], "high": ["high", "medium", "low"]}
-        tiers_to_try = tier_order.get(request.intelligence_level.value, [request.intelligence_level.value])
+        # Build tier fallback order: requested tier, then higher tiers, then
+        # (if enabled) lower tiers as a last resort.
+        tiers_to_try = self._tiers_to_try(request.intelligence_level.value)
 
         all_blocked_analyses = []
         last_error = None
         total_attempts_across_tiers = 0
 
         for tier in tiers_to_try:
+            # Enforce the documented hard timeout across tiers.
+            if self.timeout_manager.should_abort(start_time):
+                last_error = f"hard timeout ({self.timeout_manager.hard_timeout_seconds}s) exceeded"
+                break
+
             model_combinations = self.config.get_models_by_intelligence(tier)
 
             if not model_combinations:
@@ -455,16 +503,29 @@ class IntelligentRouter:
                            blocked=len(blocked_analyses))
 
                 if not usable_analyses:
-                    # Before escalating, check if a cheaper blocked circuit reopens within time budget
-                    remaining_budget = request.max_wait_seconds - (time.time() - start_time)
-                    if remaining_budget > 1:
+                    # Before escalating, check if a cheaper blocked circuit reopens
+                    # within the time budget. The budget is the caller's
+                    # max_wait_seconds, further bounded by the hard timeout.
+                    def _remaining_budget() -> float:
+                        return min(
+                            request.max_wait_seconds - (time.time() - start_time),
+                            self.timeout_manager.get_remaining_time(start_time)
+                        )
+
+                    if _remaining_budget() > 1:
                         waitable = sorted(
                             [b for b in blocked_analyses
-                             if 0 < b['wait_time_seconds'] <= remaining_budget
+                             if 0 < b['wait_time_seconds'] <= _remaining_budget()
                              and b['reason'] == 'circuit_open'],
                             key=lambda x: (x['cost_per_1k_tokens'], x['wait_time_seconds'])
                         )
                         for candidate in waitable:
+                            # Re-check the budget before each wait: earlier
+                            # candidates' sleeps consume it, and validating each
+                            # candidate against a stale budget could overshoot
+                            # the caller's limit several times over.
+                            if candidate['wait_time_seconds'] + 0.5 > _remaining_budget():
+                                continue
                             rpm = self._get_rpm_for_combination(
                                 candidate['provider'], candidate['model'], candidate['api_key_id'])
                             if self.circuit_breaker.reserve_wait_slot(
@@ -517,6 +578,10 @@ class IntelligentRouter:
 
             if result["success"]:
                 attempt_info['total_attempts'] = total_attempts_across_tiers
+                decision_reason = f"cheapest_within_estimate_after_{total_attempts_across_tiers}_attempts"
+                if tier != request.intelligence_level.value:
+                    # Disclose that the request was served by a fallback tier.
+                    decision_reason = f"tier_fallback_to_{tier}_{decision_reason}"
                 full_response = LLMResponse(
                     success=True,
                     request_id=request_id,
@@ -524,7 +589,7 @@ class IntelligentRouter:
                     model_used=used_analysis.model,
                     api_key_used=used_analysis.api_key_id,
                     routing_method=RoutingMethod.INTELLIGENCE,
-                    decision_reason=f"cheapest_within_estimate_after_{total_attempts_across_tiers}_attempts",
+                    decision_reason=decision_reason,
                     response=result["response"],
                     metadata=self._create_metadata_with_attempts(used_analysis, sorted_analyses, total_time, attempt_info)
                 )
@@ -661,9 +726,11 @@ class IntelligentRouter:
         # Apply scenario priorities and sort
         priority_map = {(provider, model): priority for provider, model, priority in scenario_combinations}
 
-        # Sort by priority first, then cost, then time
+        # Sort by scenario priority first, then flapping penalty (so unstable
+        # circuits lose ties), then cost, then time
         sorted_analyses = sorted(analyses, key=lambda x: (
             priority_map.get((x.provider, x.model), 999),
+            getattr(x, 'priority_penalty', 0),
             x.cost_per_1k_tokens,
             x.total_seconds
         ))
@@ -915,6 +982,21 @@ class IntelligentRouter:
         last_tried_provider = None
 
         while current_alternatives:
+            # Hard timeout: stop starting new attempts once the budget is gone.
+            if self.timeout_manager.should_abort(start_time):
+                elapsed = time.time() - start_time
+                self.timeout_manager.log_timeout_abort(elapsed, attempt_info["alternatives_tried"])
+                attempt_info["failures"].append({
+                    "alternative": attempt_info["alternatives_tried"],
+                    "retry": 0,
+                    "provider": None,
+                    "model": None,
+                    "api_key_id": None,
+                    "error": f"hard timeout ({self.timeout_manager.hard_timeout_seconds}s) exceeded",
+                    "strategy": "abort"
+                })
+                break
+
             # Check if we should escalate to fast mode
             if not escalated and self.timeout_manager.should_escalate(start_time):
                 escalated = True
@@ -972,6 +1054,10 @@ class IntelligentRouter:
                            provider=analysis.provider,
                            model=analysis.model)
                 
+                # Distinguishes "provider hung" from "timed out waiting for the
+                # local slot" when the attempt is cancelled (see TimeoutError).
+                attempt_marker = {}
+
                 try:
                     # Update pending tracker with current attempt
                     if request_id:
@@ -985,7 +1071,7 @@ class IntelligentRouter:
                         raise asyncio.TimeoutError("No time remaining")
 
                     result = await asyncio.wait_for(
-                        self._execute_request(analysis, messages, options),
+                        self._execute_request(analysis, messages, options, attempt_marker),
                         timeout=per_attempt_timeout
                     )
 
@@ -1106,13 +1192,24 @@ class IntelligentRouter:
                                  model=analysis.model,
                                  elapsed_seconds=elapsed)
 
-                    # Record timeout with circuit breaker
-                    if self.circuit_breaker and self.circuit_breaker.enabled:
+                    # Record timeout with circuit breaker - but only when the
+                    # upstream call actually started. A timeout spent waiting
+                    # for the local per-combination slot or rate window says
+                    # nothing about provider health; counting it would open
+                    # circuits on healthy keys under local congestion.
+                    if (self.circuit_breaker and self.circuit_breaker.enabled
+                            and attempt_marker.get("api_call_started")):
                         await self.circuit_breaker.record_failure(
                             analysis.provider, analysis.model, analysis.api_key_id,
                             error_msg, status_code=None, response_time_ms=None,
                             response_headers=None
                         )
+                    elif not attempt_marker.get("api_call_started"):
+                        logger.info("Timeout occurred before upstream call started; "
+                                    "not counted against provider circuit",
+                                    provider=analysis.provider,
+                                    model=analysis.model,
+                                    api_key_id=analysis.api_key_id)
 
                     attempt_info["failures"].append({
                         "alternative": attempt_info["alternatives_tried"],
@@ -1195,9 +1292,17 @@ class IntelligentRouter:
         """Determine error handling strategy: 'retry', 'skip_alternative', or 'skip_provider'"""
         error_lower = error_msg.lower()
         
+        # Content/length errors that retrying can't fix (checked before rate
+        # limiting: "context_length_exceeded" must not read as a rate limit)
+        if any(phrase in error_lower for phrase in [
+            "context_length_exceeded", "context length", "prompt is too long",
+            "too many tokens", "maximum context"
+        ]):
+            return "skip_alternative"
+
         # Rate limiting errors - skip to next alternative within same provider first
         if any(phrase in error_lower for phrase in [
-            "rate limited", "429", "quota", "exceeded", "resource_exhausted"
+            "rate limited", "429", "quota", "resource_exhausted"
         ]):
             return "skip_alternative"
             
@@ -1280,8 +1385,9 @@ class IntelligentRouter:
         return options_dict
 
     async def _execute_request(self, analysis: CompletionTimeAnalysis,
-                             messages: List[Message], options: Optional[LLMOptions]) -> Dict[str, Any]:
-        """Execute request to selected combination and wait for response - NO TIMEOUT"""
+                             messages: List[Message], options: Optional[LLMOptions],
+                             attempt_marker: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Execute request to selected combination and wait for response"""
         provider_config = self.config.providers[analysis.provider]
         key_config = provider_config.keys[analysis.api_key_id]
         model_config = provider_config.models[analysis.model]
@@ -1298,13 +1404,15 @@ class IntelligentRouter:
             "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
             "options": options_dict
         }
-        
-        # Execute directly and wait for response (no timeout - requests complete regardless of time)
+
+        # Execute directly and wait for response (bounded by the caller's
+        # per-attempt wait_for)
         result = await self.queues.execute_request_directly(
             analysis.provider, analysis.model, analysis.api_key_id, request_data, 0,  # max_wait_seconds=0 (ignored)
-            self.rate_limits, self.config, self.llm_client
+            self.rate_limits, self.config, self.llm_client,
+            attempt_marker=attempt_marker
         )
-        
+
         return result
     
     def _create_metadata_with_attempts(self, selected: CompletionTimeAnalysis, 

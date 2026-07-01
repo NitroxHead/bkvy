@@ -82,19 +82,42 @@ class RateLimitManager:
             logger.error("Failed to save rate limit state", 
                         combination=combination_key, error=str(e))
     
-    async def _update_rate_counters(self, state: RateLimitState):
+    @staticmethod
+    def _next_day_reset(provider: str) -> datetime:
+        """Next daily-quota reset time (UTC) for a provider.
+
+        Gemini's free-tier RPD resets at midnight Pacific (same convention the
+        failure classifier uses for 429 backoff); everything else uses UTC
+        midnight. Keeping the two in agreement matters: an early local reset
+        would over-admit requests against a still-exhausted upstream quota.
+        """
+        now_utc = datetime.now(timezone.utc)
+
+        if provider == "gemini":
+            try:
+                from zoneinfo import ZoneInfo
+                pacific = ZoneInfo("America/Los_Angeles")
+            except Exception:
+                pacific = timezone(timedelta(hours=-8))
+            now_local = now_utc.astimezone(pacific)
+            midnight = (now_local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return midnight.astimezone(timezone.utc)
+
+        return (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    async def _update_rate_counters(self, state: RateLimitState, provider: str):
         """Update rate limit counters and reset times"""
         now = datetime.now(timezone.utc)
-        
+
         # Reset minute counter if needed
         if now >= state.minute_reset_time:
             state.requests_this_minute = 0
             state.minute_reset_time = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        
+
         # Reset daily counter if needed
         if now >= state.day_reset_time:
             state.requests_today = 0
-            state.day_reset_time = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            state.day_reset_time = self._next_day_reset(provider)
     
     async def check_rate_limit_status(self, provider: str, model: str, api_key_id: str, 
                                     rpm_limit: int, rpd_limit: int) -> Tuple[bool, float]:
@@ -109,9 +132,9 @@ class RateLimitManager:
             state = self.states[combination_key]
             state.rpm_limit = rpm_limit
             state.rpd_limit = rpd_limit
-            
-            await self._update_rate_counters(state)
-            
+
+            await self._update_rate_counters(state, provider)
+
             now = datetime.now(timezone.utc)
             
             # Check if rate limited
@@ -135,24 +158,72 @@ class RateLimitManager:
         """Record a request for rate limiting purposes"""
         combination_key = self._get_combination_key(provider, model, api_key_id)
         lock = self._get_lock(combination_key)
-        
+
         async with lock:
             if combination_key not in self.states:
                 self.states[combination_key] = await self._load_state(combination_key)
-            
+
             state = self.states[combination_key]
-            await self._update_rate_counters(state)
-            
+            await self._update_rate_counters(state, provider)
+
             state.requests_this_minute += 1
             state.requests_today += 1
             state.last_request_time = datetime.now(timezone.utc)
-            
+
             await self._save_state(combination_key, state)
-    
+
+    async def try_consume(self, provider: str, model: str, api_key_id: str,
+                          rpm_limit: int, rpd_limit: int) -> Tuple[bool, float]:
+        """Atomically check the rate limit and, if allowed, record the request.
+
+        A separate check-then-record lets two concurrent requests both pass the
+        check and overshoot the limit; this holds the combination lock across
+        both steps. Returns (True, 0) when a slot was consumed, otherwise
+        (False, seconds_until_a_slot_frees).
+        """
+        combination_key = self._get_combination_key(provider, model, api_key_id)
+        lock = self._get_lock(combination_key)
+
+        async with lock:
+            if combination_key not in self.states:
+                self.states[combination_key] = await self._load_state(combination_key)
+
+            state = self.states[combination_key]
+            state.rpm_limit = rpm_limit
+            state.rpd_limit = rpd_limit
+
+            await self._update_rate_counters(state, provider)
+
+            now = datetime.now(timezone.utc)
+
+            if state.requests_this_minute >= rpm_limit:
+                wait_seconds = max(0, (state.minute_reset_time - now).total_seconds())
+                state.currently_rate_limited = True
+                state.rate_limit_wait_seconds = wait_seconds
+                return False, wait_seconds
+
+            if state.requests_today >= rpd_limit:
+                wait_seconds = max(0, (state.day_reset_time - now).total_seconds())
+                state.currently_rate_limited = True
+                state.rate_limit_wait_seconds = wait_seconds
+                return False, wait_seconds
+
+            state.currently_rate_limited = False
+            state.rate_limit_wait_seconds = 0
+            state.requests_this_minute += 1
+            state.requests_today += 1
+            state.last_request_time = now
+
+            await self._save_state(combination_key, state)
+            return True, 0
+
     async def get_all_states(self) -> Dict[str, Dict[str, any]]:
         """Get all rate limit states for monitoring"""
         states = {}
         for combination_key, state in self.states.items():
-            await self._update_rate_counters(state)
+            # combination keys are "provider_apikeyid_model"; provider names
+            # contain no underscore
+            provider = combination_key.split("_", 1)[0]
+            await self._update_rate_counters(state, provider)
             states[combination_key] = asdict(state)
         return states

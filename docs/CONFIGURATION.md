@@ -443,6 +443,26 @@ The server supports several environment variables for configuration:
 - `WORKERS` (default: `1`): Number of worker processes
 - `LOG_DIR` (default: `logs`): Directory for log files
 
+### Routing Behavior
+
+- `TIER_DOWNGRADE_ENABLED` (default: `true`): Whether intelligence routing may
+  fall back to LOWER tiers when the requested tier and all higher tiers are
+  unavailable. Fallback always tries the requested tier first, then escalates
+  upward (better models, higher cost); downgrading to a weaker model is the
+  last resort. Set to `false` to fail the request instead of ever answering
+  with a lower tier than requested. When a fallback tier serves a request, the
+  `decision_reason` field discloses it (`tier_fallback_to_<tier>_...`).
+- `RATE_LIMIT_MAX_WAIT_SECONDS` (default: `120`): Cap on how long one request
+  may wait for a local rate-limit window to clear before failing over to the
+  next alternative. `0` disables the cap.
+- `REQUEST_SOFT_TIMEOUT_SECONDS` (default: `30`): After this, routing escalates
+  to fast mode (fewer retries, prefer fast CLOSED circuits on other providers).
+- `REQUEST_HARD_TIMEOUT_SECONDS` (default: `120`): Total budget for a request.
+  No new attempts start past this point, and per-attempt timeouts shrink to fit
+  the remaining budget. Raise this if you route to slow, long-form models.
+- `STREAM_IDLE_TIMEOUT` (default: `60`): Maximum seconds between streaming
+  chunks before the stream is considered stalled.
+
 ### Statistics & Logging
 
 Both logging systems are **disabled by default** (opt-in for privacy).

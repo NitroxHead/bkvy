@@ -78,6 +78,20 @@ class FailureClassifier:
             description="Authentication failure, requires configuration fix"
         ),
 
+        FailureType.MODEL_ERROR: FailureStrategy(
+            should_circuit_break=True,
+            retry_count=0,                      # Retrying a missing model never helps
+            skip_alternatives=True,             # Move to the next alternative immediately
+            skip_provider=False,                # Other models on the provider are fine
+            backoff_schedule="exponential",
+            initial_backoff_seconds=300,
+            max_backoff_seconds=86400,          # 24 hours
+            requires_health_probe=True,         # Probes report 404 honestly
+            auto_recoverable=False,             # Usually needs a config fix
+            severity="high",
+            description="Model not found, retired, or inaccessible - check config"
+        ),
+
         FailureType.TIMEOUT_ERROR: FailureStrategy(
             should_circuit_break=True,
             retry_count=5,                      # More lenient than service errors
@@ -135,6 +149,17 @@ class FailureClassifier:
         """
         error_lower = error_message.lower()
 
+        # Request-too-large errors first: they are request-specific CONTENT
+        # errors, but their wording ("context_length_exceeded") collides with
+        # rate-limit vocabulary. Misclassifying them as 429 opens circuits on
+        # healthy keys whenever a client sends an oversized prompt.
+        if any(phrase in error_lower for phrase in [
+            "context_length_exceeded", "context length", "maximum context",
+            "prompt is too long", "too many tokens", "input token count",
+            "reduce the length"
+        ]):
+            return FailureType.CONTENT_ERROR
+
         # Check status code first (most reliable)
         if status_code:
             if status_code == 429:
@@ -143,10 +168,12 @@ class FailureClassifier:
                 return FailureType.SERVICE_ERROR_5XX
             elif status_code in [401, 403]:
                 return FailureType.AUTH_ERROR_4XX
+            elif status_code == 404:
+                return FailureType.MODEL_ERROR
 
-        # Rate limiting patterns
+        # Rate limiting patterns (no bare "exceeded" - see content check above)
         if any(phrase in error_lower for phrase in [
-            "rate limit", "429", "quota", "exceeded", "resource_exhausted",
+            "rate limit", "429", "quota", "resource_exhausted",
             "too many requests", "rate_limit_exceeded"
         ]):
             return FailureType.RATE_LIMIT_429
@@ -157,6 +184,13 @@ class FailureClassifier:
             "authentication failed", "invalid_api_key", "api key", "invalid key"
         ]):
             return FailureType.AUTH_ERROR_4XX
+
+        # Model errors: missing, retired, or inaccessible models
+        if any(phrase in error_lower for phrase in [
+            "404", "not_found", "not found", "does not exist", "unknown model",
+            "model_not_found", "has been deprecated", "end-of-life"
+        ]):
+            return FailureType.MODEL_ERROR
 
         # Service error patterns
         if any(phrase in error_lower for phrase in [
@@ -212,11 +246,12 @@ class FailureClassifier:
         """
         # Try to extract from headers first (most reliable)
         if headers:
-            # Check common rate limit headers
-            reset_time = headers.get('X-RateLimit-Reset') or \
-                        headers.get('X-Rate-Limit-Reset') or \
-                        headers.get('RateLimit-Reset') or \
-                        headers.get('Retry-After')
+            # Check common rate limit headers, case-insensitively
+            headers_lower = {str(k).lower(): v for k, v in headers.items()}
+            reset_time = headers_lower.get('x-ratelimit-reset') or \
+                        headers_lower.get('x-rate-limit-reset') or \
+                        headers_lower.get('ratelimit-reset') or \
+                        headers_lower.get('retry-after')
 
             if reset_time:
                 try:
@@ -255,6 +290,13 @@ class FailureClassifier:
         gemini_pattern = re.search(r'retry in ([\d.]+)s', error_lower)
         if gemini_pattern:
             return int(float(gemini_pattern.group(1)) + 1)  # Round up
+
+        # Pattern: "Please try again in 20s" / "try again in 6m59.56s" (OpenAI
+        # uses Go-style durations)
+        openai_pattern = re.search(r'try again in (?:(\d+)m)?([\d.]+)\s*s', error_lower)
+        if openai_pattern:
+            minutes = int(openai_pattern.group(1)) if openai_pattern.group(1) else 0
+            return minutes * 60 + int(float(openai_pattern.group(2)) + 1)  # Round up
 
         # Pattern: "retry after 60 seconds"
         retry_pattern = re.search(r'retry after (\d+) seconds?', error_lower)

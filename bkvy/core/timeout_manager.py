@@ -69,7 +69,9 @@ class GlobalTimeoutManager:
 
     def get_request_timeout(self, start_time: float, escalated: bool, default_timeout: int = 300) -> int:
         """
-        Calculate per-attempt timeout - capped so one slow provider can't starve fallbacks.
+        Calculate per-attempt timeout - capped so one slow provider can't starve
+        fallbacks, and bounded by the remaining hard-timeout budget so the
+        documented "abort completely" contract actually holds.
 
         Args:
             start_time: Request start timestamp
@@ -77,12 +79,11 @@ class GlobalTimeoutManager:
             default_timeout: Max seconds for a single attempt (non-escalated)
 
         Returns:
-            Timeout in seconds for this specific attempt
+            Timeout in seconds for this specific attempt (0 = no time remaining)
         """
-        if escalated:
-            return 100
-        else:
-            return default_timeout
+        cap = 100 if escalated else default_timeout
+        remaining = self.get_remaining_time(start_time)
+        return int(max(0, min(cap, remaining)))
 
     def reorder_for_escalation(
         self,

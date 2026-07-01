@@ -3,6 +3,7 @@ LLM client for making API calls to providers
 """
 
 import json
+import time
 import aiohttp
 from pathlib import Path
 from typing import Dict, List, Any, Optional, AsyncGenerator
@@ -12,18 +13,43 @@ from ..utils.logging import setup_logging
 logger = setup_logging()
 
 
+class ProviderAPIError(Exception):
+    """Provider HTTP error that preserves the status code and response headers.
+
+    The circuit breaker classifies failures far more reliably from the real
+    status code than from text patterns, and rate-limit reset times often
+    live in headers (Retry-After / X-RateLimit-Reset).
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None,
+                 headers: Optional[Dict[str, str]] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.headers = dict(headers) if headers else {}
+
+
 class LLMClient:
     """Handles actual API calls to LLM providers"""
-    
+
+    # How long a cached Ollama health result stays valid. The check runs in the
+    # routing hot path; without a cache an unreachable host stalls every
+    # analysis for the full connect timeout.
+    OLLAMA_HEALTH_CACHE_SECONDS = 30
+
     def __init__(self, results_dir: str = "results"):
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(exist_ok=True)
         self.session: Optional[aiohttp.ClientSession] = None
-    
+        self._ollama_health_cache: Dict[str, tuple] = {}  # endpoint -> (checked_at, healthy)
+
     async def start(self):
         """Start the HTTP session"""
+        # No total timeout: SSE streams legitimately run longer than any fixed
+        # cap (a total would kill them mid-flight). Stall protection comes from
+        # the router: per-attempt wait_for on non-streaming calls and an idle
+        # timeout between stream chunks.
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300)  # 5 minute timeout for individual requests
+            timeout=aiohttp.ClientTimeout(total=None, connect=30)
         )
     
     async def stop(self):
@@ -32,29 +58,35 @@ class LLMClient:
             await self.session.close()
     
     async def check_ollama_health(self, endpoint: str) -> bool:
-        """Check if Ollama server is available and responsive"""
+        """Check if Ollama server is available and responsive (cached briefly)"""
+        cached = self._ollama_health_cache.get(endpoint)
+        if cached and (time.monotonic() - cached[0]) < self.OLLAMA_HEALTH_CACHE_SECONDS:
+            return cached[1]
+
+        healthy = False
         try:
             # Extract base URL from chat endpoint
             if "/api/chat" in endpoint:
                 base_url = endpoint.replace("/api/chat", "")
             else:
                 base_url = endpoint
-            
+
             health_endpoint = f"{base_url}/api/version"
-            
+
             logger.info("Checking Ollama health", endpoint=health_endpoint)
-            
+
             async with self.session.get(health_endpoint, timeout=aiohttp.ClientTimeout(total=5)) as response:
                 if response.status == 200:
                     result = await response.json()
                     logger.info("Ollama health check passed", version=result.get("version", "unknown"))
-                    return True
+                    healthy = True
                 else:
                     logger.warning("Ollama health check failed", status=response.status)
-                    return False
         except Exception as e:
             logger.warning("Ollama health check failed with exception", error=str(e))
-            return False
+
+        self._ollama_health_cache[endpoint] = (time.monotonic(), healthy)
+        return healthy
 
     async def _make_api_call(self, provider: str, model: str, api_key: str,
                            messages: List[Dict], options: Dict,
@@ -153,7 +185,8 @@ class LLMClient:
         async with self.session.post(stream_endpoint, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"Gemini API error {response.status}: {error_text}")
+                raise ProviderAPIError(f"Gemini API error {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             async for data in self._iter_sse_lines(response):
                 if data == "[DONE]":
                     break
@@ -207,7 +240,9 @@ class LLMClient:
         if options.get("stop") is not None:
             payload["stop"] = options["stop"]
         if options.get("disable_thinking"):
-            payload["reasoning"] = {"effort": "low"}
+            # Chat Completions uses the flat reasoning_effort field (the
+            # {"reasoning": {...}} object is Responses-API-only and 400s here).
+            payload["reasoning_effort"] = "low"
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -216,7 +251,8 @@ class LLMClient:
         async with self.session.post(endpoint, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"OpenAI API error {response.status}: {error_text}")
+                raise ProviderAPIError(f"OpenAI API error {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             async for data in self._iter_sse_lines(response):
                 if data == "[DONE]":
                     break
@@ -278,8 +314,8 @@ class LLMClient:
             payload["top_k"] = max(1, options["top_k"])
         if options.get("stop") is not None:
             payload["stop_sequences"] = options["stop"]
-        if options.get("disable_thinking"):
-            payload["thinking"] = {"type": "enabled", "budget_tokens": 0}
+        # disable_thinking: thinking is opt-in on Anthropic; omitting the
+        # thinking block IS disabled (budget 0 would be rejected by the API).
 
         headers = {
             "x-api-key": api_key,
@@ -292,7 +328,8 @@ class LLMClient:
         async with self.session.post(endpoint, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"Anthropic API error {response.status}: {error_text}")
+                raise ProviderAPIError(f"Anthropic API error {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             async for data in self._iter_sse_lines(response):
                 try:
                     event = json.loads(data)
@@ -355,7 +392,8 @@ class LLMClient:
         async with self.session.post(endpoint, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"Ollama API error {response.status}: {error_text}")
+                raise ProviderAPIError(f"Ollama API error {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             async for raw in response.content:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -443,10 +481,12 @@ class LLMClient:
             if response.status == 429:
                 error_text = await response.text()
                 # Handle rate limiting with specific error for retry logic
-                raise Exception(f"Gemini API rate limited {response.status}: {error_text}")
+                raise ProviderAPIError(f"Gemini API rate limited {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             elif response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"Gemini API error {response.status}: {error_text}")
+                raise ProviderAPIError(f"Gemini API error {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             
             result = await response.json()
             logger.info("Gemini API response received", has_candidates=bool(result.get("candidates")))
@@ -557,10 +597,11 @@ class LLMClient:
         if "stop" in options and options["stop"] is not None:
             payload["stop"] = options["stop"]
         
-        # Add thinking control for OpenAI (reasoning models)
+        # Add thinking control for OpenAI (reasoning models). Chat Completions
+        # takes a flat reasoning_effort string; the {"reasoning": {...}} object
+        # belongs to the Responses API and 400s here.
         if "disable_thinking" in options and options["disable_thinking"]:
-            # For reasoning models, use low effort to minimize thinking
-            payload["reasoning"] = {"effort": "low"}
+            payload["reasoning_effort"] = "low"
         
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -570,18 +611,21 @@ class LLMClient:
         async with self.session.post(endpoint, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"OpenAI API error {response.status}: {error_text}")
+                raise ProviderAPIError(f"OpenAI API error {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             
             result = await response.json()
-            
+
             content = ""
+            finish_reason = None
             if "choices" in result and result["choices"]:
                 choice = result["choices"][0]
                 if "message" in choice:
                     content = choice["message"].get("content", "")
-            
+                finish_reason = choice.get("finish_reason")
+
             usage = result.get("usage", {})
-            
+
             return {
                 "content": content,
                 "usage": {
@@ -589,6 +633,8 @@ class LLMClient:
                     "output_tokens": usage.get("completion_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0)
                 },
+                "finish_reason": finish_reason,
+                "truncated": finish_reason == "length",
                 "raw_response": result
             }
     
@@ -626,15 +672,12 @@ class LLMClient:
             payload["top_k"] = max(1, options["top_k"])
         if "stop" in options and options["stop"] is not None:
             payload["stop_sequences"] = options["stop"]
-        
-        # Add thinking control for Anthropic
-        if "disable_thinking" in options and options["disable_thinking"]:
-            # Disable thinking by setting budget to 0
-            payload["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": 0
-            }
-        
+
+        # Thinking control for Anthropic: extended thinking is opt-in, so
+        # "disabled" means not sending the thinking block at all. Sending
+        # {"type": "enabled", "budget_tokens": 0} is rejected by the API
+        # (minimum budget is 1024), so there is deliberately no payload here.
+
         headers = {
             "x-api-key": api_key,
             "anthropic-version": version or "2023-06-01",
@@ -644,16 +687,18 @@ class LLMClient:
         async with self.session.post(endpoint, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"Anthropic API error {response.status}: {error_text}")
+                raise ProviderAPIError(f"Anthropic API error {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             
             result = await response.json()
-            
+
             content = ""
             if "content" in result and result["content"]:
                 content = result["content"][0].get("text", "")
-            
+
             usage = result.get("usage", {})
-            
+            finish_reason = result.get("stop_reason")
+
             return {
                 "content": content,
                 "usage": {
@@ -661,6 +706,8 @@ class LLMClient:
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
                 },
+                "finish_reason": finish_reason,
+                "truncated": finish_reason == "max_tokens",
                 "raw_response": result
             }
     
@@ -705,10 +752,12 @@ class LLMClient:
         async with self.session.post(endpoint, json=payload, headers=headers) as response:
             if response.status == 429:
                 error_text = await response.text()
-                raise Exception(f"Ollama API rate limited {response.status}: {error_text}")
+                raise ProviderAPIError(f"Ollama API rate limited {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             elif response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"Ollama API error {response.status}: {error_text}")
+                raise ProviderAPIError(f"Ollama API error {response.status}: {error_text}",
+                                       status_code=response.status, headers=dict(response.headers))
             
             result = await response.json()
             logger.info("Ollama API response received", has_message=bool(result.get("message")))

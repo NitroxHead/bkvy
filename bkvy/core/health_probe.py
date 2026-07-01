@@ -482,6 +482,16 @@ class BackgroundProbeWorker:
                 if not self.health_probe.failure_classifier.needs_health_probe(circuit.last_failure_type):
                     continue
 
+            # The Gemini probe hits the models.get metadata endpoint, which
+            # consumes no generateContent quota - it cannot observe whether a
+            # 429/quota bench has actually lifted. Closing the circuit on that
+            # probe just flaps it against a still-exhausted quota, so leave
+            # rate-limited Gemini circuits to scheduled real-traffic testing
+            # (should_try_combination → acquire_test_lock).
+            if (circuit.provider == "gemini"
+                    and circuit.last_failure_type == FailureType.RATE_LIMIT_429):
+                continue
+
             circuits_to_probe.append(circuit)
 
         if not circuits_to_probe:
