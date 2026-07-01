@@ -47,7 +47,7 @@ Route requests based on task complexity.
   - `low`: Simple questions, basic tasks
   - `medium`: Analysis, coding, reasoning  
   - `high`: Complex research, advanced reasoning
-- `max_wait_seconds` (required): Maximum acceptable wait time
+- `max_wait_seconds` (required): Per-request time budget in seconds - no new attempts start once it is spent (capped by `REQUEST_HARD_TIMEOUT_SECONDS`; <=0 = no override)
 - `messages` (required): Conversation history
 - `options` (optional): Model generation parameters
 - `debug` (optional): Return detailed debug information (default: false)

@@ -54,7 +54,7 @@ class TestBug4_BackoffUnbound(unittest.TestCase):
         circuit.consecutive_failures = 3
 
         # This used to raise UnboundLocalError: local variable 'backoff' referenced before assignment
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr._open_circuit(circuit, FailureType.AUTH_ERROR_4XX, None)
         )
 
@@ -66,7 +66,7 @@ class TestBug4_BackoffUnbound(unittest.TestCase):
         circuit = make_circuit(state=CircuitStatus.CLOSED)
         circuit.consecutive_failures = 3
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr._open_circuit(circuit, FailureType.RATE_LIMIT_429, None)
         )
 
@@ -78,7 +78,7 @@ class TestBug4_BackoffUnbound(unittest.TestCase):
         circuit = make_circuit(state=CircuitStatus.CLOSED)
         circuit.consecutive_failures = 3
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr._open_circuit(circuit, FailureType.SERVICE_ERROR_5XX, None)
         )
 
@@ -100,7 +100,7 @@ class TestBug1_FlappingNeverClears(unittest.TestCase):
         # Simulate: circuit was closed 15 minutes ago
         circuit.stable_since = datetime.now(timezone.utc) - timedelta(minutes=15)
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr._check_flapping_clear(circuit)
         )
 
@@ -117,7 +117,7 @@ class TestBug1_FlappingNeverClears(unittest.TestCase):
         # Simulate: circuit was closed 5 minutes ago
         circuit.stable_since = datetime.now(timezone.utc) - timedelta(minutes=5)
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr._check_flapping_clear(circuit)
         )
 
@@ -132,7 +132,7 @@ class TestBug1_FlappingNeverClears(unittest.TestCase):
         circuit.priority_penalty = 1000
         circuit.stable_since = None  # pre-existing circuit
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr._check_flapping_clear(circuit)
         )
 
@@ -148,7 +148,7 @@ class TestBug1_FlappingNeverClears(unittest.TestCase):
         circuit.stable_since = None
 
         before = datetime.now(timezone.utc)
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr._close_circuit(circuit)
         )
         after = datetime.now(timezone.utc)
@@ -165,7 +165,7 @@ class TestBug1_FlappingNeverClears(unittest.TestCase):
         circuit.stable_since = datetime.now(timezone.utc) - timedelta(hours=1)
         circuit.consecutive_failures = 3
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr._open_circuit(circuit, FailureType.SERVICE_ERROR_5XX, None)
         )
 
@@ -183,7 +183,7 @@ class TestBug1_FlappingNeverClears(unittest.TestCase):
         key = circuit.combination_key
         mgr.circuits[key] = circuit
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr.record_success("test", "m1", "k1")
         )
 
@@ -197,24 +197,23 @@ class TestBug1_FlappingNeverClears(unittest.TestCase):
         key = circuit.combination_key
         mgr.circuits[key] = circuit
 
-        loop = asyncio.get_event_loop()
+        async def lifecycle():
+            # Simulate flapping: open 3 times in 5 minutes
+            for _ in range(3):
+                await mgr._open_circuit(circuit, FailureType.SERVICE_ERROR_5XX, None)
+                circuit.state = CircuitStatus.HALF_OPEN
+                await mgr._close_circuit(circuit)
 
-        # Simulate flapping: open 3 times in 5 minutes
-        for _ in range(3):
-            loop.run_until_complete(
-                mgr._open_circuit(circuit, FailureType.SERVICE_ERROR_5XX, None)
-            )
-            circuit.state = CircuitStatus.HALF_OPEN
-            loop.run_until_complete(mgr._close_circuit(circuit))
+            self.assertTrue(circuit.is_flapping)
+            self.assertEqual(circuit.priority_penalty, 1000)
 
-        self.assertTrue(circuit.is_flapping)
-        self.assertEqual(circuit.priority_penalty, 1000)
+            # Simulate time passing: backdate stable_since by 11 minutes
+            circuit.stable_since = datetime.now(timezone.utc) - timedelta(minutes=11)
 
-        # Simulate time passing: backdate stable_since by 11 minutes
-        circuit.stable_since = datetime.now(timezone.utc) - timedelta(minutes=11)
+            # A success should now clear flapping
+            await mgr.record_success("test", "m1", "k1")
 
-        # A success should now clear flapping
-        loop.run_until_complete(mgr.record_success("test", "m1", "k1"))
+        asyncio.run(lifecycle())
 
         self.assertFalse(circuit.is_flapping)
         self.assertEqual(circuit.priority_penalty, 0)
@@ -233,7 +232,7 @@ class TestBug3_HalfOpenOrphan(unittest.TestCase):
         mgr.circuits[key] = circuit
 
         # CONTENT_ERROR has should_circuit_break=False
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr.record_failure("test", "m1", "k1", "empty content response")
         )
 
@@ -250,7 +249,7 @@ class TestBug3_HalfOpenOrphan(unittest.TestCase):
         key = circuit.combination_key
         mgr.circuits[key] = circuit
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr.record_failure("test", "m1", "k1", "some weird error nobody expected")
         )
 
@@ -266,7 +265,7 @@ class TestBug3_HalfOpenOrphan(unittest.TestCase):
         key = circuit.combination_key
         mgr.circuits[key] = circuit
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr.record_failure("test", "m1", "k1", "HTTP 500: internal server error")
         )
 
@@ -293,7 +292,7 @@ class TestBug2_ProbeWorkerFlappingCheck(unittest.TestCase):
         probe.enabled = False
         worker = BackgroundProbeWorker(mgr, config, probe)
 
-        asyncio.get_event_loop().run_until_complete(worker._probe_circuits())
+        asyncio.run(worker._probe_circuits())
 
         self.assertFalse(circuit.is_flapping)
         self.assertEqual(circuit.priority_penalty, 0)
@@ -343,7 +342,7 @@ class TestResetCircuit(unittest.TestCase):
         mgr.circuits[key] = circuit
 
         before = datetime.now(timezone.utc)
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             mgr.reset_circuit("test", "m1", "k1")
         )
         after = datetime.now(timezone.utc)

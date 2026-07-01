@@ -18,21 +18,58 @@ logger = setup_logging()
 
 
 class QueueManager:
-    """Tracks in-flight load and executes requests for all (API_KEY, MODEL) combinations"""
+    """Tracks in-flight load and executes requests for all (API_KEY, MODEL) combinations.
+
+    Concurrency model: requests to one combination run in parallel up to
+    MAX_CONCURRENT_PER_COMBINATION (0 = unlimited). Rate correctness does not
+    depend on serialization - slots are consumed atomically by the rate-limit
+    manager - so the cap only bounds simultaneous upstream calls and local
+    resource usage. Both the synchronous and streaming paths use the same cap.
+    """
 
     def __init__(self):
         self.states: Dict[str, QueueState] = {}
-        self._locks: Dict[str, asyncio.Lock] = {}
+        self._semaphores: Dict[str, asyncio.Semaphore] = {}
+        self.max_concurrent = int(os.getenv("MAX_CONCURRENT_PER_COMBINATION", "4"))
 
     def _get_combination_key(self, provider: str, model: str, api_key_id: str) -> str:
         """Generate unique key for (provider, model, api_key_id) combination"""
         return f"{provider}_{api_key_id}_{model}"
 
-    def _get_lock(self, combination_key: str) -> asyncio.Lock:
-        """Get or create lock for a combination"""
-        if combination_key not in self._locks:
-            self._locks[combination_key] = asyncio.Lock()
-        return self._locks[combination_key]
+    def _get_semaphore(self, combination_key: str) -> Optional[asyncio.Semaphore]:
+        """Get or create the concurrency semaphore for a combination (None = unlimited)"""
+        if self.max_concurrent <= 0:
+            return None
+        if combination_key not in self._semaphores:
+            self._semaphores[combination_key] = asyncio.Semaphore(self.max_concurrent)
+        return self._semaphores[combination_key]
+
+    async def try_acquire_slot(self, provider: str, model: str, api_key_id: str,
+                               timeout: Optional[float] = None) -> bool:
+        """Acquire the per-combination concurrency slot.
+
+        With timeout=None, waits indefinitely (callers bound it externally with
+        wait_for). With a timeout, returns False when the slot could not be
+        acquired in time - a purely local condition that must not count
+        against the provider's circuit.
+        """
+        sem = self._get_semaphore(self._get_combination_key(provider, model, api_key_id))
+        if sem is None:
+            return True
+        if timeout is None:
+            await sem.acquire()
+            return True
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def release_slot(self, provider: str, model: str, api_key_id: str):
+        """Release a previously acquired concurrency slot (no-op when unlimited)"""
+        sem = self._get_semaphore(self._get_combination_key(provider, model, api_key_id))
+        if sem is not None:
+            sem.release()
 
     def _get_state(self, combination_key: str) -> QueueState:
         """Get or create queue state for a combination"""
@@ -81,7 +118,6 @@ class QueueManager:
         former should count against the provider's circuit.
         """
         combination_key = self._get_combination_key(provider, model, api_key_id)
-        lock = self._get_lock(combination_key)
 
         request_id = str(uuid.uuid4())
         start_time = time.time()
@@ -92,7 +128,11 @@ class QueueManager:
 
         self.note_inflight_start(provider, model, api_key_id)
         try:
-            async with lock:
+            # Bound simultaneous upstream calls; the caller's per-attempt
+            # wait_for bounds this wait, and a cancellation here leaves
+            # attempt_marker unset so the timeout is not blamed on the provider.
+            await self.try_acquire_slot(provider, model, api_key_id)
+            try:
                 # Acquire a rate-limit slot (atomic check+record), waiting if
                 # the window clears soon and failing fast if it does not.
                 await self.acquire_rate_slot(provider, model, api_key_id,
@@ -133,6 +173,8 @@ class QueueManager:
                            processing_time=processing_time)
 
                 return result
+            finally:
+                self.release_slot(provider, model, api_key_id)
 
         except Exception as e:
             processing_time = time.time() - start_time

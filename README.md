@@ -133,7 +133,7 @@ curl -X POST "http://localhost:10006/llm/intelligence" \\
   }'
 ```
 
-**max_wait_seconds** are soft limits, used only for cost optimization planning. for now.
+**max_wait_seconds** is a real per-request time budget: no new attempts start once it is spent (always capped by `REQUEST_HARD_TIMEOUT_SECONDS`, default 120s). A value <= 0 means no per-request override.
 
 ## 🎛️ Routing Modes
 

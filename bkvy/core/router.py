@@ -231,10 +231,11 @@ class IntelligentRouter:
         committed = False  # becomes True once we forward the first token
 
         for tier in tiers_to_try:
-            # No token sent yet - respect the hard timeout before trying
+            # No token sent yet - respect the request budget before trying
             # another tier's alternatives.
-            if self.timeout_manager.should_abort(start_time):
-                last_error = f"hard timeout ({self.timeout_manager.hard_timeout_seconds}s) exceeded"
+            if self.timeout_manager.should_abort(start_time, request.max_wait_seconds):
+                budget = self.timeout_manager.effective_budget(request.max_wait_seconds)
+                last_error = f"request budget ({budget:.0f}s) exhausted"
                 break
 
             model_combinations = self.config.get_models_by_intelligence(tier)
@@ -257,7 +258,8 @@ class IntelligentRouter:
             # the final event tells us whether it succeeded, failed pre-commit
             # (fall back to next tier), or broke mid-stream (terminal).
             async for event in self._execute_with_fallback_stream(
-                    sorted_analyses, request.messages, request.options, start_time, request_id):
+                    sorted_analyses, request.messages, request.options, start_time, request_id,
+                    budget_seconds=request.max_wait_seconds):
                 etype = event.get("type")
                 if etype == "_committed":
                     committed = True
@@ -296,7 +298,8 @@ class IntelligentRouter:
 
     async def _execute_with_fallback_stream(self, sorted_analyses: List[CompletionTimeAnalysis],
                                             messages: List[Message], options: Optional[LLMOptions],
-                                            start_time: float, request_id: str):
+                                            start_time: float, request_id: str,
+                                            budget_seconds: Optional[float] = None):
         """Try each alternative as a stream; fall back only before the first token.
 
         Yields client-facing events (start/delta/done/error) plus internal
@@ -309,10 +312,11 @@ class IntelligentRouter:
 
         for analysis in sorted_analyses:
             # This point is only reached pre-commit (post-commit paths return),
-            # so the hard timeout applies: don't start yet another alternative
-            # once the budget is spent.
-            if self.timeout_manager.should_abort(start_time):
-                last_error = f"hard timeout ({self.timeout_manager.hard_timeout_seconds}s) exceeded"
+            # so the request budget applies: don't start yet another alternative
+            # once it is spent.
+            if self.timeout_manager.should_abort(start_time, budget_seconds):
+                budget = self.timeout_manager.effective_budget(budget_seconds)
+                last_error = f"request budget ({budget:.0f}s) exhausted"
                 break
 
             # Acquire recovery test lock for non-CLOSED circuits, same as sync path.
@@ -338,8 +342,24 @@ class IntelligentRouter:
             first_token_seen = False
             done_seen = False
             agg_content = []
+            got_slot = False
             self.queues.note_inflight_start(analysis.provider, analysis.model, analysis.api_key_id)
             try:
+                # Bound simultaneous upstream calls per combination (same cap as
+                # the sync path). Waiting for a local slot is bounded by the
+                # remaining request budget; not getting one is a local
+                # condition, never a provider failure.
+                slot_timeout = max(1.0, self.timeout_manager.get_remaining_time(start_time, budget_seconds))
+                got_slot = await self.queues.try_acquire_slot(
+                    analysis.provider, analysis.model, analysis.api_key_id,
+                    timeout=slot_timeout)
+                if not got_slot:
+                    last_error = "local concurrency slot not available within budget"
+                    logger.warning("Stream alternative skipped - concurrency slot wait exceeded budget",
+                                  provider=analysis.provider, model=analysis.model,
+                                  api_key_id=analysis.api_key_id)
+                    continue
+
                 # Atomically consume a rate-limit slot before opening the stream
                 # (mirrors sync path; closes the check-then-record race).
                 await self.queues.acquire_rate_slot(
@@ -354,47 +374,57 @@ class IntelligentRouter:
                 )
 
                 stream_iter = stream.__aiter__()
-                while True:
+                try:
+                    while True:
+                        try:
+                            event = await asyncio.wait_for(stream_iter.__anext__(), timeout=idle_timeout)
+                        except StopAsyncIteration:
+                            break
+
+                        if event["type"] == "delta":
+                            if not first_token_seen:
+                                first_token_seen = True
+                                yield {"type": "_committed"}
+                                yield {"type": "start", "request_id": request_id,
+                                       "provider": analysis.provider, "model": analysis.model,
+                                       "api_key_id": analysis.api_key_id}
+                            agg_content.append(event["content"])
+                            yield {"type": "delta", "content": event["content"]}
+
+                        elif event["type"] == "done":
+                            done_seen = True
+                            if self.circuit_breaker and self.circuit_breaker.enabled:
+                                await self.circuit_breaker.record_success(
+                                    analysis.provider, analysis.model, analysis.api_key_id, None)
+                            yield {
+                                "type": "done",
+                                "request_id": request_id,
+                                "model_used": analysis.model,
+                                "provider_used": analysis.provider,
+                                "api_key_used": analysis.api_key_id,
+                                "finish_reason": event.get("finish_reason", "stop"),
+                                "usage": event.get("usage", {}),
+                                "cost_per_1k_tokens": analysis.cost_per_1k_tokens,
+                                "content": "".join(agg_content),
+                            }
+                            return
+
+                    if not done_seen:
+                        # The provider generator ended without a "done" event. If
+                        # tokens were already forwarded, falling through to the next
+                        # alternative would splice a second model's output onto this
+                        # stream. Raise so the handler below terminates (post-commit)
+                        # or falls back cleanly (pre-commit).
+                        raise RuntimeError("stream ended without completion event")
+                finally:
+                    # Close the provider generator on every exit path so the
+                    # underlying HTTP response is released promptly (idle
+                    # timeouts and mid-stream errors would otherwise leave it
+                    # open until garbage collection).
                     try:
-                        event = await asyncio.wait_for(stream_iter.__anext__(), timeout=idle_timeout)
-                    except StopAsyncIteration:
-                        break
-
-                    if event["type"] == "delta":
-                        if not first_token_seen:
-                            first_token_seen = True
-                            yield {"type": "_committed"}
-                            yield {"type": "start", "request_id": request_id,
-                                   "provider": analysis.provider, "model": analysis.model,
-                                   "api_key_id": analysis.api_key_id}
-                        agg_content.append(event["content"])
-                        yield {"type": "delta", "content": event["content"]}
-
-                    elif event["type"] == "done":
-                        done_seen = True
-                        if self.circuit_breaker and self.circuit_breaker.enabled:
-                            await self.circuit_breaker.record_success(
-                                analysis.provider, analysis.model, analysis.api_key_id, None)
-                        yield {
-                            "type": "done",
-                            "request_id": request_id,
-                            "model_used": analysis.model,
-                            "provider_used": analysis.provider,
-                            "api_key_used": analysis.api_key_id,
-                            "finish_reason": event.get("finish_reason", "stop"),
-                            "usage": event.get("usage", {}),
-                            "cost_per_1k_tokens": analysis.cost_per_1k_tokens,
-                            "content": "".join(agg_content),
-                        }
-                        return
-
-                if not done_seen:
-                    # The provider generator ended without a "done" event. If
-                    # tokens were already forwarded, falling through to the next
-                    # alternative would splice a second model's output onto this
-                    # stream. Raise so the handler below terminates (post-commit)
-                    # or falls back cleanly (pre-commit).
-                    raise RuntimeError("stream ended without completion event")
+                        await stream_iter.aclose()
+                    except Exception:
+                        pass
 
             except Exception as e:
                 error_msg = str(e)
@@ -422,6 +452,8 @@ class IntelligentRouter:
                               provider=analysis.provider, model=analysis.model, error=error_msg)
                 continue
             finally:
+                if got_slot:
+                    self.queues.release_slot(analysis.provider, analysis.model, analysis.api_key_id)
                 self.queues.note_inflight_end(analysis.provider, analysis.model, analysis.api_key_id)
 
         # Every alternative in this tier failed before producing a token.
@@ -470,9 +502,11 @@ class IntelligentRouter:
         total_attempts_across_tiers = 0
 
         for tier in tiers_to_try:
-            # Enforce the documented hard timeout across tiers.
-            if self.timeout_manager.should_abort(start_time):
-                last_error = f"hard timeout ({self.timeout_manager.hard_timeout_seconds}s) exceeded"
+            # Enforce the request budget (max_wait_seconds, capped by the
+            # global hard timeout) across tiers.
+            if self.timeout_manager.should_abort(start_time, request.max_wait_seconds):
+                budget = self.timeout_manager.effective_budget(request.max_wait_seconds)
+                last_error = f"request budget ({budget:.0f}s) exhausted"
                 break
 
             model_combinations = self.config.get_models_by_intelligence(tier)
@@ -507,10 +541,8 @@ class IntelligentRouter:
                     # within the time budget. The budget is the caller's
                     # max_wait_seconds, further bounded by the hard timeout.
                     def _remaining_budget() -> float:
-                        return min(
-                            request.max_wait_seconds - (time.time() - start_time),
-                            self.timeout_manager.get_remaining_time(start_time)
-                        )
+                        return self.timeout_manager.get_remaining_time(
+                            start_time, request.max_wait_seconds)
 
                     if _remaining_budget() > 1:
                         waitable = sorted(
@@ -563,7 +595,8 @@ class IntelligentRouter:
             # Try executing with this tier's alternatives
             try:
                 result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-                    sorted_analyses, request.messages, request.options, start_time, request_id
+                    sorted_analyses, request.messages, request.options, start_time, request_id,
+                    budget_seconds=request.max_wait_seconds
                 )
             except Exception as e:
                 logger.error("Error in retry logic for tier, escalating",
@@ -741,7 +774,8 @@ class IntelligentRouter:
 
         # Try each alternative with retry logic
         result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-            sorted_analyses, request.messages, request.options, start_time, request_id
+            sorted_analyses, request.messages, request.options, start_time, request_id,
+            budget_seconds=request.max_wait_seconds
         )
 
         total_time = time.time() - start_time
@@ -921,7 +955,8 @@ class IntelligentRouter:
 
         # Try each alternative with retry logic
         result, used_analysis, attempt_info = await self._execute_with_retry_and_fallback(
-            sorted_analyses, request.messages, request.options, start_time, request_id
+            sorted_analyses, request.messages, request.options, start_time, request_id,
+            budget_seconds=request.max_wait_seconds
         )
 
         total_time = time.time() - start_time
@@ -963,7 +998,8 @@ class IntelligentRouter:
     
     async def _execute_with_retry_and_fallback(self, sorted_analyses: List[CompletionTimeAnalysis],
                                              messages: List[Message], options: Optional[LLMOptions],
-                                             start_time: float = None, request_id: str = None) -> Tuple[Dict[str, Any], CompletionTimeAnalysis, Dict[str, Any]]:
+                                             start_time: float = None, request_id: str = None,
+                                             budget_seconds: Optional[float] = None) -> Tuple[Dict[str, Any], CompletionTimeAnalysis, Dict[str, Any]]:
         """Execute request with retry logic and automatic failover - enhanced error handling with 429 provider awareness"""
         MAX_RETRIES = 3
         attempt_info = {
@@ -982,17 +1018,18 @@ class IntelligentRouter:
         last_tried_provider = None
 
         while current_alternatives:
-            # Hard timeout: stop starting new attempts once the budget is gone.
-            if self.timeout_manager.should_abort(start_time):
+            # Request budget: stop starting new attempts once it is gone.
+            if self.timeout_manager.should_abort(start_time, budget_seconds):
                 elapsed = time.time() - start_time
                 self.timeout_manager.log_timeout_abort(elapsed, attempt_info["alternatives_tried"])
+                budget = self.timeout_manager.effective_budget(budget_seconds)
                 attempt_info["failures"].append({
                     "alternative": attempt_info["alternatives_tried"],
                     "retry": 0,
                     "provider": None,
                     "model": None,
                     "api_key_id": None,
-                    "error": f"hard timeout ({self.timeout_manager.hard_timeout_seconds}s) exceeded",
+                    "error": f"request budget ({budget:.0f}s) exhausted",
                     "strategy": "abort"
                 })
                 break
@@ -1065,8 +1102,9 @@ class IntelligentRouter:
                         if tracker:
                             await tracker.update(request_id, analysis.provider, analysis.model, analysis.api_key_id)
 
-                    # Calculate per-attempt timeout from global remaining time
-                    per_attempt_timeout = self.timeout_manager.get_request_timeout(start_time, escalated)
+                    # Calculate per-attempt timeout from the remaining budget
+                    per_attempt_timeout = self.timeout_manager.get_request_timeout(
+                        start_time, escalated, budget_seconds=budget_seconds)
                     if per_attempt_timeout <= 0:
                         raise asyncio.TimeoutError("No time remaining")
 
@@ -1166,16 +1204,20 @@ class IntelligentRouter:
                         elif error_strategy == "retry":
                             # Continue with retry logic
                             if retry_attempt == MAX_RETRIES:
-                                logger.error("Alternative exhausted after retries", 
+                                logger.error("Alternative exhausted after retries",
                                            provider=analysis.provider,
                                            model=analysis.model,
                                            api_key_id=analysis.api_key_id,
                                            retries=MAX_RETRIES)
                                 break
                             else:
-                                # Wait a bit before retry (exponential backoff)
+                                # Wait a bit before retry (exponential backoff),
+                                # unless the backoff itself would eat the budget
                                 wait_time = min(2 ** (retry_attempt - 1), 5)  # 1s, 2s, 4s max
-                                logger.info("Retrying after wait", 
+                                if self.timeout_manager.get_remaining_time(
+                                        start_time, budget_seconds) <= wait_time:
+                                    break  # move to next alternative instead of burning the budget
+                                logger.info("Retrying after wait",
                                            wait_seconds=wait_time,
                                            next_retry=retry_attempt + 1)
                                 await asyncio.sleep(wait_time)
@@ -1273,6 +1315,9 @@ class IntelligentRouter:
                         break
                     else:
                         wait_time = min(2 ** (retry_attempt - 1), 5)
+                        if self.timeout_manager.get_remaining_time(
+                                start_time, budget_seconds) <= wait_time:
+                            break
                         await asyncio.sleep(wait_time)
         
         # All alternatives exhausted
@@ -1467,17 +1512,17 @@ class IntelligentRouter:
         """Analyze all (provider, model, api_key) combinations for routing calculations"""
         analyses = []
         
-        logger.info("🔍 ANALYSIS DEBUG: Starting analysis of combinations", 
+        logger.debug("🔍 ANALYSIS DEBUG: Starting analysis of combinations", 
                    total_combinations=len(model_combinations),
                    combinations=model_combinations,
                    max_wait_seconds=max_wait_seconds)
         
         for provider, model in model_combinations:
-            logger.info("🔍 PROVIDER DEBUG: Analyzing provider/model", 
+            logger.debug("🔍 PROVIDER DEBUG: Analyzing provider/model", 
                        provider=provider, model=model)
             
             if provider not in self.config.providers:
-                logger.warning("❌ PROVIDER DEBUG: Provider not found in config", 
+                logger.debug("❌ PROVIDER DEBUG: Provider not found in config", 
                              provider=provider,
                              available_providers=list(self.config.providers.keys()))
                 continue
@@ -1485,12 +1530,12 @@ class IntelligentRouter:
             provider_config = self.config.providers[provider]
             
             if model not in provider_config.models:
-                logger.warning("❌ MODEL DEBUG: Model not found in provider config", 
+                logger.debug("❌ MODEL DEBUG: Model not found in provider config", 
                              provider=provider, model=model,
                              available_models=list(provider_config.models.keys()))
                 continue
             
-            logger.info("✅ PROVIDER DEBUG: Provider and model found, checking API keys",
+            logger.debug("✅ PROVIDER DEBUG: Provider and model found, checking API keys",
                        provider=provider, model=model,
                        available_keys=list(provider_config.keys.keys()))
             
@@ -1498,18 +1543,18 @@ class IntelligentRouter:
             key_count = 0
             for api_key_id, key_config in provider_config.keys.items():
                 key_count += 1
-                logger.info("🔑 KEY DEBUG: Checking API key", 
+                logger.debug("🔑 KEY DEBUG: Checking API key", 
                            provider=provider, model=model, api_key_id=api_key_id,
                            key_num=f"{key_count}/{len(provider_config.keys)}")
                 
                 # Check if this key supports this model
                 if model not in key_config.rate_limits:
-                    logger.warning("❌ KEY DEBUG: Model not in rate limits for key", 
+                    logger.debug("❌ KEY DEBUG: Model not in rate limits for key", 
                                  provider=provider, model=model, api_key_id=api_key_id,
                                  available_models=list(key_config.rate_limits.keys()))
                     continue
                 
-                logger.info("✅ KEY DEBUG: Key supports model, performing analysis",
+                logger.debug("✅ KEY DEBUG: Key supports model, performing analysis",
                            provider=provider, model=model, api_key_id=api_key_id)
                 
                 analysis = await self._analyze_combination(
@@ -1517,7 +1562,7 @@ class IntelligentRouter:
                 )
                 
                 if analysis:
-                    logger.info("✅ ANALYSIS DEBUG: Analysis completed successfully", 
+                    logger.debug("✅ ANALYSIS DEBUG: Analysis completed successfully", 
                                provider=provider, model=model, api_key_id=api_key_id,
                                total_seconds=analysis.total_seconds,
                                cost=analysis.cost_per_1k_tokens,
@@ -1525,14 +1570,14 @@ class IntelligentRouter:
                     
                     # Include all analyses (remove time filter for routing)
                     analyses.append(analysis)
-                    logger.info("✅ ADDED DEBUG: Analysis added to alternatives",
+                    logger.debug("✅ ADDED DEBUG: Analysis added to alternatives",
                                provider=provider, model=model, api_key_id=api_key_id,
                                total_valid_alternatives=len(analyses))
                 else:
-                    logger.error("❌ ANALYSIS DEBUG: Analysis failed", 
+                    logger.debug("❌ ANALYSIS DEBUG: Analysis failed", 
                                provider=provider, model=model, api_key_id=api_key_id)
         
-        logger.info("🏁 ANALYSIS DEBUG: Analysis complete", 
+        logger.debug("🏁 ANALYSIS DEBUG: Analysis complete", 
                    total_combinations_checked=len(model_combinations),
                    valid_combinations=len(analyses),
                    alternatives=[{

@@ -31,7 +31,7 @@ class IntelligenceRequest(BaseModel):
     
     client_id: str = Field(..., description="Client identifier")
     intelligence_level: IntelligenceLevel = Field(..., description="Required intelligence level")
-    max_wait_seconds: int = Field(..., description="Maximum estimated wait time for routing (calculation only)")
+    max_wait_seconds: int = Field(..., description="Per-request time budget in seconds (capped by REQUEST_HARD_TIMEOUT_SECONDS; <=0 means no per-request override)")
     messages: List[Message] = Field(..., description="Conversation messages")
     options: Optional[LLMOptions] = Field(None, description="Generation options")
     debug: Optional[bool] = Field(False, description="Return detailed debug information")
@@ -42,7 +42,7 @@ class ScenarioRequest(BaseModel):
     
     client_id: str = Field(..., description="Client identifier")
     scenario: str = Field(..., description="Scenario name from routing.json")
-    max_wait_seconds: int = Field(..., description="Maximum estimated wait time for routing (calculation only)")
+    max_wait_seconds: int = Field(..., description="Per-request time budget in seconds (capped by REQUEST_HARD_TIMEOUT_SECONDS; <=0 means no per-request override)")
     messages: List[Message] = Field(..., description="Conversation messages")
     options: Optional[LLMOptions] = Field(None, description="Generation options")
     debug: Optional[bool] = Field(False, description="Return detailed debug information")
@@ -55,7 +55,7 @@ class DirectRequest(BaseModel):
     provider: str = Field(..., description="Provider name (gemini, openai, anthropic)")
     model_name: str = Field(..., description="Model name", alias="model")
     api_key_id: Optional[str] = Field(None, description="Specific API key ID (auto-select if None)")
-    max_wait_seconds: int = Field(..., description="Maximum estimated wait time for routing (calculation only)")
+    max_wait_seconds: int = Field(..., description="Per-request time budget in seconds (capped by REQUEST_HARD_TIMEOUT_SECONDS; <=0 means no per-request override)")
     messages: List[Message] = Field(..., description="Conversation messages")
     options: Optional[LLMOptions] = Field(None, description="Generation options")
     debug: Optional[bool] = Field(False, description="Return detailed debug information")

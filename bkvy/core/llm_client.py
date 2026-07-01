@@ -144,23 +144,34 @@ class LLMClient:
             if line.startswith("data:"):
                 yield line[len("data:"):].strip()
 
-    async def _stream_gemini(self, endpoint: str, api_key: str,
-                             messages: List[Dict], options: Dict
-                             ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream from Gemini via streamGenerateContent?alt=sse."""
+    @staticmethod
+    def _build_gemini_payload(messages: List[Dict], options: Dict) -> Dict[str, Any]:
+        """Build a Gemini generateContent payload (shared by sync and stream).
+
+        - Explicit roles ("user"/"model") so multi-turn conversations are
+          unambiguous (role-less entries are only valid for single-turn).
+        - System messages go through systemInstruction instead of being
+          inlined as pseudo-user text.
+        - Stop sequences map to generationConfig.stopSequences.
+        """
         contents = []
+        system_parts = []
         for msg in messages:
-            if msg["role"] == "user":
-                contents.append({"parts": [{"text": msg["content"]}]})
+            if msg["role"] == "system":
+                system_parts.append({"text": msg["content"]})
             elif msg["role"] == "assistant":
-                contents.append({"parts": [{"text": msg["content"]}], "role": "model"})
-            elif msg["role"] == "system":
-                contents.insert(0, {"parts": [{"text": f"System: {msg['content']}"}]})
+                contents.append({"role": "model", "parts": [{"text": msg["content"]}]})
+            else:  # user (and any unrecognized role degrades to user)
+                contents.append({"role": "user", "parts": [{"text": msg["content"]}]})
 
         payload = {"contents": contents}
+        if system_parts:
+            payload["systemInstruction"] = {"parts": system_parts}
+
         if options:
             generation_config = {}
             if options.get("max_tokens") is not None:
+                # Ensure minimum token count for Gemini
                 generation_config["maxOutputTokens"] = max(options["max_tokens"], 50)
             if options.get("temperature") is not None:
                 generation_config["temperature"] = options["temperature"]
@@ -168,10 +179,20 @@ class LLMClient:
                 generation_config["topP"] = options["top_p"]
             if options.get("top_k") is not None:
                 generation_config["topK"] = options["top_k"]
+            if options.get("stop") is not None:
+                generation_config["stopSequences"] = options["stop"]
             if options.get("disable_thinking"):
                 generation_config["thinkingConfig"] = {"thinkingBudget": 0}
             if generation_config:
                 payload["generationConfig"] = generation_config
+
+        return payload
+
+    async def _stream_gemini(self, endpoint: str, api_key: str,
+                             messages: List[Dict], options: Dict
+                             ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream from Gemini via streamGenerateContent?alt=sse."""
+        payload = self._build_gemini_payload(messages, options)
 
         # Convert ":generateContent" endpoint to streaming form.
         stream_endpoint = endpoint.replace(":generateContent", ":streamGenerateContent")
@@ -425,48 +446,8 @@ class LLMClient:
     async def _call_gemini(self, endpoint: str, api_key: str, 
                           messages: List[Dict], options: Dict) -> Dict[str, Any]:
         """Call Gemini API with robust response parsing and error handling"""
-        # Convert messages to Gemini format
-        contents = []
-        for msg in messages:
-            if msg["role"] == "user":
-                contents.append({
-                    "parts": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                contents.append({
-                    "parts": [{"text": msg["content"]}],
-                    "role": "model"
-                })
-            elif msg["role"] == "system":
-                # Add system message as first user message
-                contents.insert(0, {
-                    "parts": [{"text": f"System: {msg['content']}"}]
-                })
-        
-        payload = {
-            "contents": contents
-        }
-        
-        # Add generation config if options provided
-        if options:
-            generation_config = {}
-            if "max_tokens" in options and options["max_tokens"] is not None:
-                # Ensure minimum token count for Gemini
-                generation_config["maxOutputTokens"] = max(options["max_tokens"], 50)
-            if "temperature" in options and options["temperature"] is not None:
-                generation_config["temperature"] = options["temperature"]
-            if "top_p" in options and options["top_p"] is not None:
-                generation_config["topP"] = options["top_p"]
-            if "top_k" in options and options["top_k"] is not None:
-                generation_config["topK"] = options["top_k"]
-            
-            # Add thinking control for Gemini
-            if "disable_thinking" in options and options["disable_thinking"]:
-                generation_config["thinkingConfig"] = {"thinkingBudget": 0}
-            
-            if generation_config:
-                payload["generationConfig"] = generation_config
-        
+        payload = self._build_gemini_payload(messages, options)
+
         headers = {
             "x-goog-api-key": api_key,
             "Content-Type": "application/json"

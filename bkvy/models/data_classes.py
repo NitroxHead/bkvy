@@ -9,7 +9,13 @@ from typing import Dict, List, Optional, Any
 
 @dataclass
 class RateLimitState:
-    """Track rate limit state for a specific (API_KEY, MODEL) combination"""
+    """Track rate limit state for a specific (API_KEY, MODEL) combination.
+
+    RPM uses a true 60-second sliding window (recent_request_times) so bursts
+    straddling a calendar-minute boundary cannot exceed the provider's actual
+    limit. requests_this_minute and minute_reset_time are derived from the
+    window and kept for monitoring/serialization compatibility.
+    """
     requests_this_minute: int = 0
     requests_today: int = 0
     minute_reset_time: datetime = None
@@ -19,6 +25,7 @@ class RateLimitState:
     rpm_limit: int = 0
     rpd_limit: int = 0
     last_request_time: datetime = None
+    recent_request_times: List[datetime] = None  # sliding RPM window
 
     def __post_init__(self):
         if self.minute_reset_time is None:
@@ -27,6 +34,8 @@ class RateLimitState:
         if self.day_reset_time is None:
             now = datetime.now(timezone.utc)
             self.day_reset_time = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if self.recent_request_times is None:
+            self.recent_request_times = []
 
 
 @dataclass 

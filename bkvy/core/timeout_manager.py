@@ -4,7 +4,7 @@ Global timeout manager for request execution
 
 import os
 import time
-from typing import List, Callable, Any, Dict
+from typing import List, Callable, Any, Dict, Optional
 from ..models.data_classes import CompletionTimeAnalysis
 from ..models.circuit_states import CircuitStatus
 from ..utils.logging import setup_logging
@@ -27,6 +27,14 @@ class GlobalTimeoutManager:
             hard_timeout=self.hard_timeout_seconds
         )
 
+    def effective_budget(self, budget_seconds: Optional[float] = None) -> float:
+        """Total time budget for a request: the global hard timeout, tightened
+        by the caller's max_wait_seconds when that is smaller. Non-positive or
+        missing budgets mean "no per-request override"."""
+        if budget_seconds and budget_seconds > 0:
+            return min(self.hard_timeout_seconds, budget_seconds)
+        return self.hard_timeout_seconds
+
     def should_escalate(self, start_time: float) -> bool:
         """
         Check if request should escalate to faster strategy
@@ -40,49 +48,53 @@ class GlobalTimeoutManager:
         elapsed = time.time() - start_time
         return elapsed > self.soft_timeout_seconds
 
-    def should_abort(self, start_time: float) -> bool:
+    def should_abort(self, start_time: float, budget_seconds: Optional[float] = None) -> bool:
         """
         Check if request should abort completely
 
         Args:
             start_time: Request start timestamp
+            budget_seconds: Optional per-request budget (caller's max_wait_seconds)
 
         Returns:
-            True if hard timeout exceeded
+            True if the request's time budget is exhausted
         """
         elapsed = time.time() - start_time
-        return elapsed > self.hard_timeout_seconds
+        return elapsed > self.effective_budget(budget_seconds)
 
-    def get_remaining_time(self, start_time: float) -> float:
+    def get_remaining_time(self, start_time: float, budget_seconds: Optional[float] = None) -> float:
         """
-        Get remaining time until hard timeout
+        Get remaining time in the request's budget
 
         Args:
             start_time: Request start timestamp
+            budget_seconds: Optional per-request budget (caller's max_wait_seconds)
 
         Returns:
             Seconds remaining (0 if exceeded)
         """
         elapsed = time.time() - start_time
-        remaining = self.hard_timeout_seconds - elapsed
+        remaining = self.effective_budget(budget_seconds) - elapsed
         return max(0, remaining)
 
-    def get_request_timeout(self, start_time: float, escalated: bool, default_timeout: int = 300) -> int:
+    def get_request_timeout(self, start_time: float, escalated: bool, default_timeout: int = 300,
+                            budget_seconds: Optional[float] = None) -> int:
         """
         Calculate per-attempt timeout - capped so one slow provider can't starve
-        fallbacks, and bounded by the remaining hard-timeout budget so the
+        fallbacks, and bounded by the remaining request budget so the
         documented "abort completely" contract actually holds.
 
         Args:
             start_time: Request start timestamp
             escalated: Whether request is in escalated mode
             default_timeout: Max seconds for a single attempt (non-escalated)
+            budget_seconds: Optional per-request budget (caller's max_wait_seconds)
 
         Returns:
             Timeout in seconds for this specific attempt (0 = no time remaining)
         """
         cap = 100 if escalated else default_timeout
-        remaining = self.get_remaining_time(start_time)
+        remaining = self.get_remaining_time(start_time, budget_seconds)
         return int(max(0, min(cap, remaining)))
 
     def reorder_for_escalation(
@@ -105,27 +117,24 @@ class GlobalTimeoutManager:
         Returns:
             Reordered list optimized for speed
         """
-        # Filter to only CLOSED circuits
-        closed_only = [
-            alt for alt in alternatives
-            if alt.circuit_state == CircuitStatus.CLOSED
-        ]
-
-        if not closed_only:
-            # No CLOSED circuits available, use all
-            closed_only = alternatives
+        # Prefer CLOSED circuits, but keep the rest at the tail - dropping
+        # them would forfeit fallback coverage if every CLOSED circuit fails.
+        closed = [alt for alt in alternatives if alt.circuit_state == CircuitStatus.CLOSED]
+        non_closed = [alt for alt in alternatives if alt.circuit_state != CircuitStatus.CLOSED]
 
         # Sort by:
         # 1. Different provider than current (for diversity)
         # 2. Speed (total_seconds)
         # 3. Cost (tiebreaker)
-        closed_only.sort(key=lambda x: (
+        speed_key = lambda x: (
             0 if x.provider != current_provider else 1,  # Prioritize different provider
             x.total_seconds,                               # Then fastest
             x.cost_per_1k_tokens                           # Then cheapest
-        ))
+        )
+        closed.sort(key=speed_key)
+        non_closed.sort(key=speed_key)
 
-        return closed_only
+        return closed + non_closed
 
     def create_timeout_failure(
         self,

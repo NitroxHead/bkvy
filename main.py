@@ -30,8 +30,15 @@ def main():
     port = int(os.getenv("PORT", 10006))
     log_level = os.getenv("LOG_LEVEL", "info").lower()
     workers = int(os.getenv("WORKERS", 1))
-    
-    logger.info("Starting bkvy", 
+    if workers > 1:
+        # Rate-limit counters, circuit states, and queue accounting all assume
+        # a single process; parallel workers would each keep their own
+        # counters and trample each other's state files.
+        logger.warning("WORKERS>1 is not supported (single-process state model); forcing 1 worker",
+                      requested_workers=workers)
+        workers = 1
+
+    logger.info("Starting bkvy",
                host=host, port=port, log_level=log_level, workers=workers)
     
     # Create the FastAPI application

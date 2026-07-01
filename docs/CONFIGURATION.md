@@ -455,6 +455,10 @@ The server supports several environment variables for configuration:
 - `RATE_LIMIT_MAX_WAIT_SECONDS` (default: `120`): Cap on how long one request
   may wait for a local rate-limit window to clear before failing over to the
   next alternative. `0` disables the cap.
+- `MAX_CONCURRENT_PER_COMBINATION` (default: `4`): Maximum simultaneous
+  upstream calls per (provider, key, model) combination, applied to both
+  regular and streaming requests. `0` removes the cap. Rate limits are
+  enforced independently of this setting; this only bounds parallelism.
 - `REQUEST_SOFT_TIMEOUT_SECONDS` (default: `30`): After this, routing escalates
   to fast mode (fewer retries, prefer fast CLOSED circuits on other providers).
 - `REQUEST_HARD_TIMEOUT_SECONDS` (default: `120`): Total budget for a request.
