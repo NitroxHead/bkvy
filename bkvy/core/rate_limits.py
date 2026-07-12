@@ -248,7 +248,9 @@ class RateLimitManager:
     async def get_all_states(self) -> Dict[str, Dict[str, any]]:
         """Get all rate limit states for monitoring"""
         states = {}
-        for combination_key, state in self.states.items():
+        # list() snapshot: the await below yields to request handlers that may
+        # add new combinations, and dict mutation mid-iteration raises.
+        for combination_key, state in list(self.states.items()):
             # combination keys are "provider_apikeyid_model"; provider names
             # contain no underscore
             provider = combination_key.split("_", 1)[0]

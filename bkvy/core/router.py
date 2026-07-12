@@ -320,6 +320,7 @@ class IntelligentRouter:
                 break
 
             # Acquire recovery test lock for non-CLOSED circuits, same as sync path.
+            test_lock_acquired = False
             if (self.circuit_breaker and self.circuit_breaker.enabled
                     and hasattr(analysis, 'circuit_state')
                     and analysis.circuit_state != CircuitStatus.CLOSED):
@@ -327,6 +328,7 @@ class IntelligentRouter:
                     analysis.provider, analysis.model, analysis.api_key_id)
                 if not locked:
                     continue
+                test_lock_acquired = True
 
             provider_config = self.config.providers[analysis.provider]
             key_config = provider_config.keys[analysis.api_key_id]
@@ -380,6 +382,12 @@ class IntelligentRouter:
                             event = await asyncio.wait_for(stream_iter.__anext__(), timeout=idle_timeout)
                         except StopAsyncIteration:
                             break
+                        except asyncio.TimeoutError:
+                            # str(TimeoutError) is empty - raise a descriptive
+                            # error so the circuit breaker classifies it as a
+                            # timeout and the client sees why the stream ended.
+                            raise RuntimeError(
+                                f"stream idle timeout: no data received for {idle_timeout}s")
 
                         if event["type"] == "delta":
                             if not first_token_seen:
@@ -396,6 +404,7 @@ class IntelligentRouter:
                             if self.circuit_breaker and self.circuit_breaker.enabled:
                                 await self.circuit_breaker.record_success(
                                     analysis.provider, analysis.model, analysis.api_key_id, None)
+                                test_lock_acquired = False  # consumed by record_success
                             yield {
                                 "type": "done",
                                 "request_id": request_id,
@@ -438,6 +447,7 @@ class IntelligentRouter:
                         status_code=getattr(e, "status_code", None),
                         response_time_ms=None,
                         response_headers=getattr(e, "headers", None))
+                    test_lock_acquired = False  # consumed by record_failure
 
                 if first_token_seen:
                     # Committed - cannot fall back without splicing models. Terminal.
@@ -455,6 +465,13 @@ class IntelligentRouter:
                 if got_slot:
                     self.queues.release_slot(analysis.provider, analysis.model, analysis.api_key_id)
                 self.queues.note_inflight_end(analysis.provider, analysis.model, analysis.api_key_id)
+                if test_lock_acquired:
+                    # The attempt ended without a test outcome (slot-wait
+                    # skip, or the client closed the stream). Free the probe
+                    # lock now instead of stranding the circuit in HALF_OPEN
+                    # until the probe-lock timeout.
+                    await self.circuit_breaker.release_test_lock(
+                        analysis.provider, analysis.model, analysis.api_key_id)
 
         # Every alternative in this tier failed before producing a token.
         yield {"type": "_tier_failed", "error": last_error}
@@ -1062,6 +1079,7 @@ class IntelligentRouter:
             # For recovery-eligible circuits (not CLOSED), acquire the test lock
             # right before we actually send a request.  If another request already
             # holds the lock we skip to the next alternative instead of waiting.
+            test_lock_acquired = False
             if (self.circuit_breaker and self.circuit_breaker.enabled
                     and hasattr(analysis, 'circuit_state')
                     and analysis.circuit_state != CircuitStatus.CLOSED):
@@ -1073,6 +1091,7 @@ class IntelligentRouter:
                                model=analysis.model,
                                api_key_id=analysis.api_key_id)
                     continue
+                test_lock_acquired = True
 
             logger.info("Trying alternative",
                        alternative_num=attempt_info["alternatives_tried"],
@@ -1129,6 +1148,7 @@ class IntelligentRouter:
                                 analysis.api_key_id,
                                 response_time_ms
                             )
+                            test_lock_acquired = False  # consumed by record_success
 
                         return result, analysis, attempt_info
                     else:
@@ -1148,6 +1168,7 @@ class IntelligentRouter:
                                 response_time_ms,
                                 result.get("headers")
                             )
+                            test_lock_acquired = False  # consumed by record_failure
 
                             # Use circuit breaker's strategy
                             if should_skip_prov:
@@ -1211,6 +1232,19 @@ class IntelligentRouter:
                                            retries=MAX_RETRIES)
                                 break
                             else:
+                                # If this failure just opened the circuit
+                                # (threshold reached mid-loop), retrying the
+                                # same combination would bypass the breaker -
+                                # move to the next alternative instead.
+                                if self.circuit_breaker and self.circuit_breaker.enabled:
+                                    can_retry, _, _ = await self.circuit_breaker.should_try_combination(
+                                        analysis.provider, analysis.model, analysis.api_key_id)
+                                    if not can_retry:
+                                        logger.info("Circuit opened mid-retry, moving to next alternative",
+                                                   provider=analysis.provider,
+                                                   model=analysis.model,
+                                                   api_key_id=analysis.api_key_id)
+                                        break
                                 # Wait a bit before retry (exponential backoff),
                                 # unless the backoff itself would eat the budget
                                 wait_time = min(2 ** (retry_attempt - 1), 5)  # 1s, 2s, 4s max
@@ -1246,12 +1280,21 @@ class IntelligentRouter:
                             error_msg, status_code=None, response_time_ms=None,
                             response_headers=None
                         )
+                        test_lock_acquired = False  # consumed by record_failure
                     elif not attempt_marker.get("api_call_started"):
                         logger.info("Timeout occurred before upstream call started; "
                                     "not counted against provider circuit",
                                     provider=analysis.provider,
                                     model=analysis.model,
                                     api_key_id=analysis.api_key_id)
+                        if test_lock_acquired:
+                            # No upstream call was made, so no record_* call
+                            # will free the probe lock - release it here or the
+                            # circuit stays locked in HALF_OPEN until the
+                            # probe-lock timeout.
+                            await self.circuit_breaker.release_test_lock(
+                                analysis.provider, analysis.model, analysis.api_key_id)
+                            test_lock_acquired = False
 
                     attempt_info["failures"].append({
                         "alternative": attempt_info["alternatives_tried"],
@@ -1279,6 +1322,7 @@ class IntelligentRouter:
                             response_time_ms=None,
                             response_headers=None
                         )
+                        test_lock_acquired = False  # consumed by record_failure
 
                         # Use circuit breaker's strategy
                         if should_skip_prov:
@@ -1314,6 +1358,12 @@ class IntelligentRouter:
                     if error_strategy != "retry" or retry_attempt == MAX_RETRIES:
                         break
                     else:
+                        # Same mid-loop circuit check as the result-failure path
+                        if self.circuit_breaker and self.circuit_breaker.enabled:
+                            can_retry, _, _ = await self.circuit_breaker.should_try_combination(
+                                analysis.provider, analysis.model, analysis.api_key_id)
+                            if not can_retry:
+                                break
                         wait_time = min(2 ** (retry_attempt - 1), 5)
                         if self.timeout_manager.get_remaining_time(
                                 start_time, budget_seconds) <= wait_time:

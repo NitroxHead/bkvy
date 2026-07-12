@@ -195,9 +195,9 @@ class CircuitBreakerManager:
         if circuit.state == CircuitStatus.HALF_OPEN:
             # Any failure during recovery testing means test failed - always reopen.
             # should_circuit_break governs CLOSED→OPEN transitions, not HALF_OPEN→OPEN.
-            await self._open_circuit(circuit, failure_type, response_headers)
+            await self._open_circuit(circuit, failure_type, response_headers, error_message)
         elif should_open and circuit.state != CircuitStatus.OPEN:
-            await self._open_circuit(circuit, failure_type, response_headers)
+            await self._open_circuit(circuit, failure_type, response_headers, error_message)
         elif (
             circuit.state == CircuitStatus.OPEN
             and circuit.next_test_time is None
@@ -206,7 +206,7 @@ class CircuitBreakerManager:
             # Failure recorded against an already-OPEN circuit that has no recovery
             # schedule (non-auth). Without this, next_test_time stays None forever and
             # should_attempt_recovery would strand the key. Re-open to re-arm it.
-            await self._open_circuit(circuit, failure_type, response_headers)
+            await self._open_circuit(circuit, failure_type, response_headers, error_message)
 
         # Persist state
         await self.persistence.save_state(circuit)
@@ -217,9 +217,15 @@ class CircuitBreakerManager:
         self,
         circuit: CircuitState,
         failure_type: FailureType,
-        response_headers: Optional[dict] = None
+        response_headers: Optional[dict] = None,
+        error_message: Optional[str] = None
     ):
-        """Open a circuit and set recovery time"""
+        """Open a circuit and set recovery time.
+
+        error_message, when provided, is the UNTRUNCATED provider error:
+        rate-limit reset hints ("retry in Ns", daily-quota markers) often sit
+        past the 500-char cut applied to circuit.last_error_message.
+        """
         previous_state = circuit.state
 
         # Clear probe lock when reopening circuit (failed test probe)
@@ -243,7 +249,7 @@ class CircuitBreakerManager:
         if failure_type == FailureType.RATE_LIMIT_429:
             # Try to extract reset time from headers
             reset_seconds = self.failure_classifier.extract_rate_limit_reset_time(
-                circuit.last_error_message,
+                error_message or circuit.last_error_message,
                 response_headers
             )
 
@@ -331,6 +337,13 @@ class CircuitBreakerManager:
             # Success during testing - close the circuit
             await self._close_circuit(circuit)
 
+        elif circuit.state == CircuitStatus.OPEN:
+            # A real request succeeded while the circuit was OPEN (in-flight
+            # overlap, or a retry that outlived the opening). That is the same
+            # evidence as a successful recovery test - close instead of leaving
+            # a proven-working key benched until next_test_time.
+            await self._close_circuit(circuit, reason="success_while_open")
+
         elif circuit.state == CircuitStatus.CLOSED:
             # Sliding window automatically expires old failures
             # Just sync the failure_count for consistency
@@ -343,7 +356,7 @@ class CircuitBreakerManager:
         # Persist state
         await self.persistence.save_state(circuit)
 
-    async def _close_circuit(self, circuit: CircuitState):
+    async def _close_circuit(self, circuit: CircuitState, reason: str = "success_after_testing"):
         """Close a circuit after successful recovery"""
         # Calculate recovery time if we have opening time
         if circuit.last_failure_time and circuit.state == CircuitStatus.HALF_OPEN:
@@ -355,7 +368,7 @@ class CircuitBreakerManager:
         # Record state change
         circuit.record_state_change(
             CircuitStatus.CLOSED,
-            "success_after_testing"
+            reason
         )
 
         # Reset failure tracking
@@ -608,6 +621,38 @@ class CircuitBreakerManager:
             api_key_id=api_key_id
         )
         return True
+
+    async def release_test_lock(self, provider: str, model: str, api_key_id: str):
+        """Release a probe lock when the test never reached the provider.
+
+        For attempts that acquired the lock but aborted for a local reason
+        (concurrency-slot timeout, client disconnect): the aborted attempt says
+        nothing about provider health, so return the circuit to OPEN with its
+        existing schedule instead of leaving it locked in HALF_OPEN until the
+        probe-lock timeout expires. No-op if the lock is not held.
+        """
+        circuit = self._get_or_create_circuit(provider, model, api_key_id)
+
+        if not circuit.test_probe_in_progress:
+            return
+
+        circuit.test_probe_in_progress = False
+        circuit.test_probe_started_at = None
+
+        if circuit.state == CircuitStatus.HALF_OPEN:
+            circuit.record_state_change(
+                CircuitStatus.OPEN,
+                "recovery_test_aborted_locally"
+            )
+
+        await self.persistence.save_state(circuit)
+
+        logger.info(
+            "Released test lock without a test outcome",
+            provider=provider,
+            model=model,
+            api_key_id=api_key_id
+        )
 
     async def _check_flapping(self, circuit: CircuitState):
         """Check if circuit is flapping and apply penalty"""

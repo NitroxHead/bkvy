@@ -391,8 +391,11 @@ class BackgroundProbeWorker:
         probe_timeout_seconds = int(os.getenv("PROBE_LOCK_TIMEOUT_SECONDS", "300"))
         stuck_circuits_cleared = 0
 
-        # First, clean up stuck HALF_OPEN circuits
-        for circuit in self.circuit_breaker.circuits.values():
+        # First, clean up stuck HALF_OPEN circuits.
+        # Snapshot with list(): the awaits inside this loop yield to request
+        # handlers that add circuits, and mutating the dict mid-iteration
+        # raises RuntimeError and aborts the whole probe cycle.
+        for circuit in list(self.circuit_breaker.circuits.values()):
             if circuit.state == CircuitStatus.HALF_OPEN:
                 if not circuit.test_probe_in_progress:
                     # HALF_OPEN with no probe in progress - stuck (loaded from disk or
@@ -445,7 +448,8 @@ class BackgroundProbeWorker:
             )
 
         # Check CLOSED+flapping circuits for flapping clearance
-        for circuit in self.circuit_breaker.circuits.values():
+        # (list() snapshot for the same mid-iteration mutation reason)
+        for circuit in list(self.circuit_breaker.circuits.values()):
             if circuit.is_flapping and circuit.state == CircuitStatus.CLOSED:
                 await self.circuit_breaker._check_flapping_clear(circuit)
                 # Persist changes (stable_since backfill or flapping cleared)

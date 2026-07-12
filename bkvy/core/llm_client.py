@@ -131,8 +131,14 @@ class LLMClient:
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
-        async for event in gen:
-            yield event
+        # try/finally so closing THIS generator also closes the provider
+        # generator: a bare `async for` would leave it (and its HTTP response)
+        # suspended until garbage collection when the caller calls aclose().
+        try:
+            async for event in gen:
+                yield event
+        finally:
+            await gen.aclose()
 
     @staticmethod
     async def _iter_sse_lines(response) -> AsyncGenerator[str, None]:
